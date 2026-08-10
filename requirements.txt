@@ -1,0 +1,9 @@
+# Live market data
+ccxt>=4.3.0
+
+# Technical analysis
+pandas>=2.2.0
+numpy>=1.26.0
+
+# sqlite3 is part of the Python standard library.
+# Do not install sqlite3 from PyPI.

@@ -1,0 +1,10 @@
+{"time": "2026-08-08T23:14:23.795153+00:00", "event": "proposal", "details": {"contract": "BTC-Sept-27", "side": "buy", "amount": 750.0}, "prev": "0000000000000000", "hash": "13a6a3438115aad8"}
+{"time": "2026-08-08T23:14:55.748853+00:00", "event": "human_approved", "details": {"contract": "BTC-Sept-27", "amount": 750.0}, "prev": "13a6a3438115aad8", "hash": "47243546ac0bf9e2"}
+{"time": "2026-08-08T23:14:55.749100+00:00", "event": "executed", "details": {"contract": "BTC-Sept-27", "side": "buy", "amount": 750.0}, "prev": "47243546ac0bf9e2", "hash": "bfcf57559eb8dded"}
+{"time": "2026-08-08T23:57:01.872032+00:00", "event": "proposal", "details": {"contract": "BTC-Sept-27", "side": "buy", "amount": 750.0}, "prev": "bfcf57559eb8dded", "hash": "4ab401877721cb5f"}
+{"time": "2026-08-08T23:57:01.877147+00:00", "event": "human_approved", "details": {"contract": "BTC-Sept-27", "amount": 750.0}, "prev": "4ab401877721cb5f", "hash": "d677e8e7183a700c"}
+{"time": "2026-08-08T23:57:01.877305+00:00", "event": "executed", "details": {"contract": "BTC-Sept-27", "side": "buy", "amount": 750.0}, "prev": "d677e8e7183a700c", "hash": "dce0b56afea726f3"}
+{"time": "2026-08-09T00:01:44.382074+00:00", "event": "price_fetch_error", "details": {"error": "_ssl.c:983: The handshake operation timed out"}, "prev": "dce0b56afea726f3", "hash": "4d7f4fccc31ca039"}
+{"time": "2026-08-09T00:01:44.389655+00:00", "event": "proposal", "details": {"contract": "BTC-Sept-27", "side": "buy", "amount": 750.0}, "prev": "4d7f4fccc31ca039", "hash": "0a2760a83386c3c3"}
+{"time": "2026-08-09T00:01:44.395023+00:00", "event": "human_approved", "details": {"contract": "BTC-Sept-27", "amount": 750.0}, "prev": "0a2760a83386c3c3", "hash": "dd9969d1fac230bd"}
+{"time": "2026-08-09T00:01:44.395175+00:00", "event": "executed", "details": {"contract": "BTC-Sept-27", "side": "buy", "amount": 750.0}, "prev": "dd9969d1fac230bd", "hash": "9afc9b627de221e8"}
