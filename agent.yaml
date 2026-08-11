@@ -1,7 +1,7 @@
 # OKX AI Genesis / X Layer — Finance Copilot submission manifest
 name: Robo-Shopper Finance Copilot
 slug: robo-shopper-finance-copilot
-version: 1.0.0
+version: 2.0.0
 category: finance_copilot
 tagline: A governed, memory-aware trading copilot on X Layer that enforces a 2% risk rulebook and only acts through human-approved Onchain OS commands.
 
@@ -102,3 +102,10 @@ links:
   repo: https://github.com/Ibis01/robo-shopper
   demo_video: https://youtu.be/my_DEMO
   docs: ./README.md
+
+resubmission:
+  previous_entry: Robo-Shopper v1
+  type: major_upgrade
+  note: >
+    Full architectural rewrite of our original submission into a governed,
+    memory-aware Finance Copilot on X Layer. See docs/resubmission_note.md.
