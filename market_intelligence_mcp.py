@@ -25,9 +25,9 @@ class MarketDataError(RuntimeError):
 @dataclass(frozen=True)
 class MarketIntelligenceConfig:
     preferred_exchange: str = field(
-        default_factory=lambda: os.getenv("ROBO_MARKET_EXCHANGE", "binance").lower()
+        default_factory=lambda: os.getenv("ROBO_MARKET_EXCHANGE", "bybit").lower()
     )
-    supported_exchanges: Tuple[str, ...] = ("binance", "okx")
+    supported_exchanges: Tuple[str, ...] = ("bybit", "kucoin", "binance", "okx")
     default_quote_asset: str = "USDT"
     default_timeframe: str = "1h"
     rsi_period: int = 14
@@ -313,8 +313,17 @@ def _analyze_ohlcv(ohlcv: List[List[float]], config: MarketIntelligenceConfig) -
 
 async def _get_spot_quote(gateway: PublicExchangeGateway, symbol: str) -> Dict[str, Any]:
     try:
-        result = await gateway.fetch("ticker", symbol)
-        ticker = result["payload"]
+        try:
+            result = await gateway.fetch("ticker", symbol)
+            ticker = result["payload"]
+        except MarketDataError:
+            logger.warning("Crypto exchanges blocked for ticker. Falling back to Yahoo Finance.")
+            import yfinance as yf
+            base = symbol.split('/')[0]
+            tk = yf.Ticker(f"{base}-USD")
+            info = tk.fast_info
+            ticker = {"last": info.last_price, "bid": info.last_price, "ask": info.last_price, "quoteVolume": info.three_month_average_volume}
+            result = {"exchange": "yahoo_finance", "symbol": symbol, "payload": ticker}
 
         last = _safe_float(ticker.get("last"))
         bid = _safe_float(ticker.get("bid"))
@@ -439,13 +448,26 @@ async def _get_technicals(
             min(int(limit or config.min_candles), config.max_candles),
         )
 
-        result = await gateway.fetch(
-            "ohlcv",
-            symbol,
-            timeframe=resolved_timeframe,
-            limit=safe_limit,
-        )
-        payload = result["payload"]
+        try:
+            result = await gateway.fetch(
+                "ohlcv",
+                symbol,
+                timeframe=resolved_timeframe,
+                limit=safe_limit,
+            )
+            payload = result["payload"]
+        except MarketDataError:
+            logger.warning("Crypto exchanges blocked. Falling back to Yahoo Finance.")
+            import yfinance as yf
+            base = symbol.split('/')[0]
+            df = yf.Ticker(f"{base}-USD").history(period="7d", interval="1h")
+            if df.empty:
+                raise MarketDataError("yfinance returned no data")
+            payload = [
+                [int(row.Index.timestamp() * 1000), float(row.Open), float(row.High), float(row.Low), float(row.Close), float(row.Volume)]
+                for row in df.itertuples()
+            ]
+            result = {"exchange": "yahoo_finance", "symbol": symbol, "payload": payload}
 
         if not payload:
             return _error_payload(
