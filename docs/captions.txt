@@ -1,0 +1,13 @@
+[1] ROBO-SHOPPER — a governed finance copilot on X Layer
+
+[2] THE VOICE: scans BTC/ETH/SOL every 60s, flags setups on its own
+
+[3] THE BRAIN: reads the alert, pulls live data + its own trade memory
+
+[4] THE RULEBOOK: max 2% portfolio risk, overbought gate, sized from the stop
+
+[5] THE BIG GREEN BUTTON: it never executes — I approve every trade
+
+[6] THE MEMORY: every trade, PnL and my feedback — remembered forever
+
+[7] Live on Onchain OS: okx.ai/agents/10732 • github.com/ibis01/robo-shopper

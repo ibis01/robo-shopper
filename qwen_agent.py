@@ -8,9 +8,15 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
-MY_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_KEY_HERE")
-MY_BASE_URL = "https://api.groq.com/openai/v1"
-MODEL = "llama-3.3-70b-versatile"
+_QWEN_MODE = os.getenv("QWEN_MODE", "cloud")
+if _QWEN_MODE == "local":
+    MY_API_KEY = "ollama"
+    MY_BASE_URL = "http://localhost:11434/v1"
+    MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+else:
+    MY_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_KEY_HERE")
+    MY_BASE_URL = "https://api.groq.com/openai/v1"
+    MODEL = "llama-3.3-70b-versatile"
 
 
     
@@ -22,7 +28,10 @@ client = OpenAI(api_key=MY_API_KEY, base_url=MY_BASE_URL)
 
 SYSTEM_PROMPT = """
 You are an institutional-grade Governed Trading Copilot managing a $10,000 portfolio on X Layer.
-You DO NOT guess. You strictly follow the governance protocol using your MCP tools:
+You DO NOT guess.
+
+CRITICAL: You MUST use your available tools by emitting function calls. DO NOT print JSON blocks, <json> tags, or code. Invoke the tools directly.
+ You strictly follow the governance protocol using your MCP tools:
 1. Always use `analyze_technicals` to assess the market.
 2. Use `get_derivatives_context` for funding/OI crowding context.
 3. Check `get_trade_history` to learn from past mistakes and human feedback.
@@ -78,6 +87,7 @@ async def run_qwen_agent():
                             messages=messages,
                             tools=openai_tools,
                             tool_choice="auto",
+                            temperature=0.1,
                         )
 
                         msg = response.choices[0].message
@@ -88,6 +98,23 @@ async def run_qwen_agent():
                             msg_dict["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
                         messages.append(msg_dict)
 
+                        if not msg.tool_calls and msg.content:
+                            # Try to parse JSON array of tool calls from content
+                            try:
+                                content = msg.content.strip()
+                                if content.startswith("```"):
+                                    content = content.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+                                parsed_calls = json.loads(content)
+                                if isinstance(parsed_calls, list) and all(isinstance(c, dict) and 'name' in c for c in parsed_calls):
+                                    print("🔄 Intercepted JSON tool calls from model output...")
+                                    class FakeToolCall:
+                                        def __init__(self, name, args, idx):
+                                            self.id = f"call_local_{idx}"
+                                            self.function = type('obj', (object,), {'name': name, 'arguments': json.dumps(args)})()
+                                    msg.tool_calls = [FakeToolCall(c['name'], c.get('arguments', {}), i) for i, c in enumerate(parsed_calls)]
+                                    msg_dict["tool_calls"] = [{"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}} for tc in msg.tool_calls]
+                            except Exception:
+                                pass
                         if not msg.tool_calls:
                             print(f"\n🤖 Qwen:\n{msg.content}\n")
                             break

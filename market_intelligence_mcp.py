@@ -320,6 +320,7 @@ async def _get_spot_quote(gateway: PublicExchangeGateway, symbol: str) -> Dict[s
             logger.warning("Crypto exchanges blocked for ticker. Falling back to Yahoo Finance.")
             import yfinance as yf
             base = symbol.split('/')[0]
+            base = next((base[:-len(q)] for q in ("USDT","USDC","BUSD","USD") if base.endswith(q) and len(base)>len(q)), base)
             tk = yf.Ticker(f"{base}-USD")
             info = tk.fast_info
             ticker = {"last": info.last_price, "bid": info.last_price, "ask": info.last_price, "quoteVolume": info.three_month_average_volume}
@@ -460,6 +461,7 @@ async def _get_technicals(
             logger.warning("Crypto exchanges blocked. Falling back to Yahoo Finance.")
             import yfinance as yf
             base = symbol.split('/')[0]
+            base = next((base[:-len(q)] for q in ("USDT","USDC","BUSD","USD") if base.endswith(q) and len(base)>len(q)), base)
             df = yf.Ticker(f"{base}-USD").history(period="7d", interval="1h")
             if df.empty:
                 raise MarketDataError("yfinance returned no data")
