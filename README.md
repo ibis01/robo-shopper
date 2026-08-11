@@ -109,3 +109,4 @@ check for a 0.5 ETH buy at 1894 with a 1860 stop."*
 ## License
 
 MIT
+# robo-shopper
