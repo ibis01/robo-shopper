@@ -56,3 +56,14 @@ def register(mcp: FastMCP):
                     (trade_id, pnl, tax, datetime.now(timezone.utc).isoformat()))
         con.commit()
         return {"trade_id": trade_id, "tax_amount": tax, "command": cmd, "status": "recorded - human approval required to execute"}
+
+    @mcp.tool()
+    def propose_idle_sweep(idle_usd: float) -> dict:
+        """Propose sweeping idle USDT into a safe X Layer yield vault while awaiting setups."""
+        cmd = f"onchainos defi invest --token USDT --amount {idle_usd} --protocol aave_v3 --chain xlayer_test"
+        return {
+            "idle_usd": idle_usd,
+            "target": "Aave V3 USDT vault (X Layer)",
+            "command": cmd,
+            "note": "Idle capital earns yield while waiting for the next approved setup."
+        }
