@@ -1,4 +1,5 @@
 import treasury_mcp  # V3
+import guardrails_mcp  # V4
 import sys
 from functools import partial
 print = partial(print, file=sys.stderr)
@@ -61,4 +62,5 @@ if __name__ == "__main__":
     print("👀 Proactive market monitor is running in the background.")
     print("🛠️  Tools registered: Market Data, Memory, Risk, On-Chain Execution.")
     treasury_mcp.register(mcp)  # V3
+    guardrails_mcp.register(mcp)  # V4
     mcp.run()
