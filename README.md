@@ -111,3 +111,20 @@ check for a 0.5 ETH buy at 1894 with a 1860 stop."*
 MIT
 # robo-shopper
 # robo-shopper
+
+---
+
+## 🧬 V3 Roadmap: Economic Autonomy (In Progress)
+
+V3 transforms Robo-Shopper from a tool into a self-sustaining economic entity:
+
+### 1. The Agentic Treasury (Stage 1 ✅)
+- **Self-Funding:** The agent controls its own wallet (`0x8d65...c1cc`).
+- **Performance Tax:** It autonomously skims 2% of *realized profits* to pay for its own Groq API credits and gas fees. It pays for its own brain.
+
+### 2. The x402 Memory Paywall (Stage 2 ✅)
+- **Monetized Intelligence:** The agent exposes its SQLite trade memory via an x402-gated API.
+- **Pay-to-Query:** Other agents must pay 0.05 USDC to query its historical win-rates. If they don't pay, it returns `HTTP 402 Payment Required`.
+
+### 3. Idle Capital Sweep (Stage 3 - Coming Soon)
+- **Zero Dead Capital:** Un-deployed USDT will be autonomously swept into safe X Layer yield vaults (Aave V3) while waiting for human-approved setups.

@@ -1,3 +1,4 @@
+import treasury_mcp  # V3
 import sys
 from functools import partial
 print = partial(print, file=sys.stderr)
@@ -16,6 +17,10 @@ from proactive_alerts_mcp import _monitor_markets
 
 # Initialize the MCP Server with Institutional System Prompt
 mcp = FastMCP(
+
+# V3 Treasury Injection
+
+# V3 Treasury Registration
     "Governed Trading Copilot",
     instructions="""
     You are an institutional-grade Governed Trading Copilot. You manage a $10,000 portfolio.
@@ -40,6 +45,7 @@ register_onchain_execution_tools(mcp)
 # This prevents asyncio event loop conflicts with the FastMCP server
 def start_background_monitor():
     try:
+
         asyncio.run(_monitor_markets())
     except KeyboardInterrupt:
         pass
@@ -54,4 +60,5 @@ if __name__ == "__main__":
     print("🚀 Starting Governed Trading Copilot MCP Server...")
     print("👀 Proactive market monitor is running in the background.")
     print("🛠️  Tools registered: Market Data, Memory, Risk, On-Chain Execution.")
+    treasury_mcp.register(mcp)  # V3
     mcp.run()
