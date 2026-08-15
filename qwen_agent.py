@@ -117,6 +117,13 @@ async def run_qwen_agent():
                                 pass
                         if not msg.tool_calls:
                             print(f"\n🤖 Qwen:\n{msg.content}\n")
+                            # ⚡ ONE-CLICK APPROVAL HOOK
+                            if msg.content and "onchainos" in msg.content:
+                                ans = input("\n⚡ Execute this command? [y/N]: ").strip().lower()
+                                if ans in ("y", "yes"):
+                                    print("✅ APPROVED - copy the command above to execute.")
+                                else:
+                                    print("❌ REJECTED by user.")
                             break
 
                         for tool_call in msg.tool_calls:
