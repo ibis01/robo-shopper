@@ -1,72 +1,82 @@
-import treasury_mcp  # V3
-import guardrails_mcp  # V4
-import confluence_mcp  # V4
-import webhook_mcp  # V4
-import treasury_yield_mcp  # V4
-import sys
-from functools import partial
-print = partial(print, file=sys.stderr)
+import json
+from mcp.server import Server, NotificationOptions
+from mcp.server.models import InitializationOptions
+import mcp.server.stdio
+import mcp.types as types
 
-import os
-import threading
-import asyncio
-from fastmcp import FastMCP
+# Import all MCP modules
+import market_intelligence_mcp
+import risk_management_mcp
+import trade_memory_mcp
+import onchain_execution_mcp
+import proactive_alerts_mcp
+import finance_copilot_skills_mcp
+# NEW IMPORTS
+import options_mcp
+import prediction_mcp
+import news_mcp
 
-# Import all governance modules
-from market_intelligence_mcp import register_market_intelligence_tools
-from trade_memory_mcp import register_trade_memory_tools
-from risk_management_mcp import register_risk_management_tools
-from onchain_execution_mcp import register_onchain_execution_tools
-from proactive_alerts_mcp import _monitor_markets
+server = Server("robo-shopper-universal")
 
-# Initialize the MCP Server with Institutional System Prompt
-mcp = FastMCP(
+@server.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    return [
+        # --- Existing Tools ---
+        types.Tool(name="analyze_technicals", description="Get RSI, SMA, support/resistance", inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}}}),
+        types.Tool(name="get_trade_history", description="Fetch past trades from SQLite", inputSchema={"type": "object", "properties": {"limit": {"type": "integer"}}}),
+        types.Tool(name="calculate_position_size", description="Calculate size based on 2% risk rule", inputSchema={"type": "object", "properties": {"entry": {"type": "number"}, "stop": {"type": "number"}, "portfolio": {"type": "number"}}}),
+        types.Tool(name="propose_trade", description="Log trade intent to ledger", inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}, "side": {"type": "string"}, "size": {"type": "number"}, "entry": {"type": "number"}, "stop": {"type": "number"}}}),
+        types.Tool(name="format_onchainos_command", description="Generate CLI command for execution", inputSchema={"type": "object", "properties": {"symbol": {"type": "string"}, "amount": {"type": "number"}}}),
+        
+        # --- NEW Tools (Options) ---
+        types.Tool(name="get_deribit_summary", description="Get BTC/ETH option chain data from Deribit", inputSchema={"type": "object", "properties": {"currency": {"type": "string", "enum": ["BTC", "ETH"]}}}),
+        types.Tool(name="suggest_option_strategy", description="Suggest option strategies based on volatility", inputSchema={"type": "object", "properties": {"currency": {"type": "string"}, "sentiment": {"type": "string"}}}),
+        
+        # --- NEW Tools (Prediction) ---
+        types.Tool(name="get_polymarket_markets", description="Fetch live prediction markets", inputSchema={"type": "object", "properties": {"limit": {"type": "integer"}}}),
+        types.Tool(name="verify_prediction_odds", description="Verify odds against reality", inputSchema={"type": "object", "properties": {"slug": {"type": "string"}}}),
+        
+        # --- NEW Tools (News) ---
+        types.Tool(name="get_crypto_sentiment", description="Get crypto news headlines and sentiment", inputSchema={"type": "object", "properties": {"coin": {"type": "string"}}}),
+    ]
 
-# V3 Treasury Injection
-
-# V3 Treasury Registration
-    "Governed Trading Copilot",
-    instructions="""
-    You are an institutional-grade Governed Trading Copilot. You manage a $10,000 portfolio.
-    You do not execute trades blindly. You follow a strict governance protocol:
+@server.call_tool()
+async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
+    args = arguments or {}
     
-    1. MARKET CONTEXT: Always use `analyze_technicals` and `get_spot_quote` before proposing a trade.
-    2. MEMORY: Always use `get_trade_history` to check your win/loss ratio and read past human feedback to avoid repeating mistakes.
-    3. RISK GATEKEEPING: You MUST pass proposed trades through `evaluate_trade_risk`. If the decision is 'REJECTED', you must abort and explain why. If 'REQUIRES_EXTRA_CONFIRMATION', you must explicitly warn the human about the RSI/Overbought danger.
-    4. MEMORY LOGGING: Before asking for approval, log the intent using `propose_trade`.
-    5. EXECUTION: NEVER execute a swap directly. Use `execute_onchain_swap` to generate the exact `onchainos` CLI command. Present this command to the human and wait for them to copy/paste it into their terminal.
-    6. POST-TRADE: Once the human confirms the trade filled, update the database using `record_execution`.
-    """
-)
+    # Route to appropriate MCP handler
+    # Existing handlers...
+    if name == "analyze_technicals": result = market_intelligence_mcp.analyze_technicals(args.get("symbol"))
+    elif name == "get_trade_history": result = trade_memory_mcp.get_trade_history(args.get("limit"))
+    elif name == "calculate_position_size": result = risk_management_mcp.calculate_position_size(args.get("entry"), args.get("stop"), args.get("portfolio"))
+    elif name == "propose_trade": result = trade_memory_mcp.propose_trade(args.get("symbol"), args.get("side"), args.get("size"), args.get("entry"), args.get("stop"))
+    elif name == "format_onchainos_command": result = onchain_execution_mcp.format_onchainos_command(args.get("symbol"), args.get("amount"))
+    
+    # NEW Handlers
+    elif name == "get_deribit_summary": result = options_mcp.get_deribit_summary(args.get("currency", "BTC"))
+    elif name == "suggest_option_strategy": result = options_mcp.suggest_option_strategy(args.get("currency", "BTC"), args.get("sentiment", "neutral"))
+    elif name == "get_polymarket_markets": result = prediction_mcp.get_polymarket_markets(args.get("limit", 5))
+    elif name == "verify_prediction_odds": result = prediction_mcp.verify_prediction_odds(args.get("slug"))
+    elif name == "get_crypto_sentiment": result = news_mcp.get_crypto_sentiment(args.get("coin", "BTC"))
+    else: result = f"Error: Tool {name} not found"
+    
+    return [types.TextContent(type="text", text=str(result))]
 
-# Register all tools
-register_market_intelligence_tools(mcp)
-register_trade_memory_tools(mcp)
-register_risk_management_tools(mcp)
-register_onchain_execution_tools(mcp)
-
-# Start the proactive monitor safely in a background thread
-# This prevents asyncio event loop conflicts with the FastMCP server
-def start_background_monitor():
-    try:
-
-        asyncio.run(_monitor_markets())
-    except KeyboardInterrupt:
-        pass
-
-monitor_thread = threading.Thread(target=start_background_monitor, daemon=True)
-if os.getenv("ROBO_VOICE", "on") == "on":
-    monitor_thread.start()
-else:
-    print("🔇 Voice disabled via ROBO_VOICE=off (standalone monitor expected).")
+async def main():
+    async with mcp.server.stdio.stdio_server() as (read_stream, write_stream):
+        await server.run(
+            read_stream,
+            write_stream,
+            InitializationOptions(
+                server_name="robo-shopper-universal",
+                server_version="4.0",
+                capabilities=server.get_capabilities(
+                    notification_options=NotificationOptions(),
+                    experimental_capabilities={},
+                ),
+            ),
+        )
 
 if __name__ == "__main__":
-    print("🚀 Starting Governed Trading Copilot MCP Server...")
-    print("👀 Proactive market monitor is running in the background.")
-    print("🛠️  Tools registered: Market Data, Memory, Risk, On-Chain Execution.")
-    treasury_mcp.register(mcp)  # V3
-    guardrails_mcp.register(mcp)  # V4
-    confluence_mcp.register(mcp)  # V4
-    webhook_mcp.register(mcp)  # V4
-    treasury_yield_mcp.register(mcp)  # V4
-    mcp.run()
+    import asyncio
+    asyncio.run(main())

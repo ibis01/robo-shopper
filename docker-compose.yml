@@ -7,7 +7,20 @@ services:
     build: .
     command: uvicorn x402_paywall:app --host 0.0.0.0 --port 8002
     ports: ["8002:8002"]
+    # FastAPI Dashboard (runs on port 8003)
   dashboard:
     build: .
+    container_name: robo-shopper-dashboard
     command: uvicorn dashboard:app --host 0.0.0.0 --port 8003
-    ports: ["8003:8003"]
+    environment:
+      - OLLAMA_HOST=http://host.docker.internal:11434
+    volumes:
+      - ./data:/app/data # mounts your trades.db
+      - ./.env:/app/.env # optional: for wallet address
+    ports:
+      - "8003:8003" # visit http://localhost:8003
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - robo-net
