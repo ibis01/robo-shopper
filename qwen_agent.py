@@ -9,6 +9,7 @@ from mcp.client.stdio import stdio_client
 
 
 from llm_adapter import make_client  # V4 sprint 6
+import telegram_notify
 client, MODEL, _PROVIDER = make_client()
 print(f"🔌 LLM provider: {_PROVIDER} | model: {MODEL}")
 
@@ -105,6 +106,7 @@ async def run_qwen_agent():
                             print(f"\n🤖 Qwen:\n{msg.content}\n")
                             # ⚡ ONE-CLICK APPROVAL HOOK
                             if msg.content and "onchainos" in msg.content:
+                                telegram_notify.send_alert(msg.content)
                                 ans = input("\n⚡ Execute this command? [y/N]: ").strip().lower()
                                 if ans in ("y", "yes"):
                                     print("✅ APPROVED - copy the command above to execute.")

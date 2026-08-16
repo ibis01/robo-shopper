@@ -39,4 +39,4 @@ def make_client():
     kwargs = {"api_key": api_key}
     if cfg["base_url"]:
         kwargs["base_url"] = cfg["base_url"]
-    return OpenAI(**kwargs, timeout=120.0)  # 2 minutes for complex reasoning, model, name
+    return OpenAI(**kwargs, timeout=120.0), model, name
