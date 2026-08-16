@@ -27,6 +27,12 @@ def summary():
     daily = con.execute("SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='closed' AND closed_at>=?",
                         (cutoff,)).fetchone()[0]
     tax = con.execute("SELECT COALESCE(SUM(tax_amount),0) FROM treasury").fetchone()[0]
+    con.execute("CREATE TABLE IF NOT EXISTS treasury_yield (id INTEGER PRIMARY KEY AUTOINCREMENT, amount_usd REAL, apy REAL, deployed_at TEXT, protocol TEXT, chain TEXT, active INTEGER DEFAULT 1)")
+    yield_rows = con.execute("SELECT COALESCE(SUM(amount_usd),0), COUNT(*) FROM treasury_yield WHERE active=1").fetchone()
+    yield_deployed, yield_count = yield_rows[0], yield_rows[1]
+    con.execute("CREATE TABLE IF NOT EXISTS treasury_yield (id INTEGER PRIMARY KEY AUTOINCREMENT, amount_usd REAL, apy REAL, deployed_at TEXT, protocol TEXT, chain TEXT, active INTEGER DEFAULT 1)")
+    yield_rows = con.execute("SELECT COALESCE(SUM(amount_usd),0), COUNT(*) FROM treasury_yield WHERE active=1").fetchone()
+    yield_deployed, yield_count = yield_rows[0], yield_rows[1]
     open_notional = con.execute(
         "SELECT COALESCE(SUM(proposed_amount*COALESCE(actual_entry_price,proposed_price,0)),0) "
         "FROM trades WHERE status NOT IN ('closed','proposed','rejected')").fetchone()[0]
@@ -64,6 +70,8 @@ async function tick(){
     ['Breaker', d.breaker, d.breaker=='ARMED'?'green':'red'],
     ['Open exposure', '$'+d.open_notional, 'amber'],
     ['Agent tax bank', '$'+d.tax_collected, 'green'],
+    ['Yield deployed', '$'+d.yield_deployed+' ('+d.yield_positions+' pos)', 'amber'],
+    ['Yield deployed', '$'+d.yield_deployed+' ('+d.yield_positions+' pos)', 'amber'],
   ];
   document.getElementById('cards').innerHTML =
     c.map(x=>'<div class=card>'+x[0]+'<b class="'+x[2]+'">'+x[1]+'</b></div>').join('');

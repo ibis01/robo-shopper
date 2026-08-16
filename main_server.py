@@ -2,6 +2,7 @@ import treasury_mcp  # V3
 import guardrails_mcp  # V4
 import confluence_mcp  # V4
 import webhook_mcp  # V4
+import treasury_yield_mcp  # V4
 import sys
 from functools import partial
 print = partial(print, file=sys.stderr)
@@ -67,4 +68,5 @@ if __name__ == "__main__":
     guardrails_mcp.register(mcp)  # V4
     confluence_mcp.register(mcp)  # V4
     webhook_mcp.register(mcp)  # V4
+    treasury_yield_mcp.register(mcp)  # V4
     mcp.run()
