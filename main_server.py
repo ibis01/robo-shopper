@@ -10,7 +10,7 @@ import risk_management_mcp
 import trade_memory_mcp
 import onchain_execution_mcp
 import proactive_alerts_mcp
-import finance_copilot_skills_mcp
+# import finance_copilot_skills_mcp  # V2 module removed
 # NEW IMPORTS
 import options_mcp
 import prediction_mcp
