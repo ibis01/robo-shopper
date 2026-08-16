@@ -1,4 +1,5 @@
 FROM python:3.12-slim
+RUN ln -sf /usr/bin/python3 /usr/bin/python
 WORKDIR /app
 # node+npm only for supergateway (the stdio→SSE bridge)
 RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm \
