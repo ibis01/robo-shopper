@@ -8,23 +8,9 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
 
-_QWEN_MODE = os.getenv("QWEN_MODE", "cloud")
-if _QWEN_MODE == "local":
-    MY_API_KEY = "ollama"
-    MY_BASE_URL = "http://localhost:11434/v1"
-    MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
-else:
-    MY_API_KEY = os.getenv("GROQ_API_KEY", "YOUR_GROQ_KEY_HERE")
-    MY_BASE_URL = "https://api.groq.com/openai/v1"
-    MODEL = "llama-3.3-70b-versatile"
-
-
-    
-
-print(f"🔑 Using API Key starting with: {MY_API_KEY[:10]}...")
-print(f"🌐 Using Base URL: {MY_BASE_URL}")
-
-client = OpenAI(api_key=MY_API_KEY, base_url=MY_BASE_URL)
+from llm_adapter import make_client  # V4 sprint 6
+client, MODEL, _PROVIDER = make_client()
+print(f"🔌 LLM provider: {_PROVIDER} | model: {MODEL}")
 
 SYSTEM_PROMPT = """
 You are an institutional-grade Governed Trading Copilot managing a $10,000 portfolio on X Layer.
