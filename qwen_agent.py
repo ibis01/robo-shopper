@@ -63,6 +63,7 @@ async def run_qwen_agent():
             while True:
                 try:
                     user_input = input("\n🧑 You: ")
+                    _proposed = False
                     if user_input.lower() in ("exit", "quit"):
                         break
 
@@ -105,7 +106,7 @@ async def run_qwen_agent():
                         if not msg.tool_calls:
                             print(f"\n🤖 Qwen:\n{msg.content}\n")
                             # ⚡ ONE-CLICK APPROVAL HOOK
-                            if msg.content and "onchainos" in msg.content:
+                            if msg.content and ("onchainos" in msg.content or _proposed):
                                 telegram_notify.send_alert(msg.content)
                                 ans = input("\n⚡ Execute this command? [y/N]: ").strip().lower()
                                 if ans in ("y", "yes"):
@@ -115,6 +116,9 @@ async def run_qwen_agent():
                             break
 
                         for tool_call in msg.tool_calls:
+                            if getattr(tool_call.function, 'name', '') == 'propose_trade':
+                                _proposed = True
+                                telegram_notify.send_alert('📊 New trade proposal logged: ' + str(tool_call.function.arguments))
                             name = tool_call.function.name
                             args = json.loads(tool_call.function.arguments or "{}")
                             print(f"🛠️  [tool] {name}({args})")
