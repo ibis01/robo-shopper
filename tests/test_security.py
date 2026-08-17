@@ -212,3 +212,41 @@ def test_awaiting_approval_cannot_execute(clean_db):
     result = execute_trade(tid, execution_price=60000)
     assert result["status"] == "REJECTED"
     assert "must be 'approved'" in result["reason"]
+
+def test_modified_risk_amount_fails(clean_db):
+    prop = propose_trade("BTC", "long", 0.4, 60000, 59500, reasoning="test")
+    tid = prop["trade_id"]
+    screen_trade(tid)
+    req = request_approval(tid)
+    token = req["approval_token"]
+    approve_trade(token)
+    # Modify risk_amount in DB (assuming it's stored or can be derived)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # risk_amount is not stored directly; we need to change quantity or stop to affect it
+    # but we can just change quantity, which is already tested.
+    # For completeness, we can test by changing stop loss, which changes risk_amount.
+    cursor.execute("UPDATE trades SET stop_loss = 59000 WHERE id = ?", (tid,))
+    conn.commit()
+    conn.close()
+    result = execute_trade(tid, execution_price=60100)
+    assert result["status"] == "REJECTED"
+    assert "Hash mismatch" in result["reason"]
+
+def test_modified_expiration_fails(clean_db):
+   
+    from schemas import TradeProposal
+    import datetime
+    p1 = TradeProposal(
+        asset="BTC", side="LONG", entry_price=60000, stop_loss=59500,
+        quantity=0.4, risk_percent=0.02, portfolio_balance_at_time=10000,
+        agent_reasoning="test", risk_decision="PASSED",
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+    )
+    p2 = TradeProposal(
+        asset="BTC", side="LONG", entry_price=60000, stop_loss=59500,
+        quantity=0.4, risk_percent=0.02, portfolio_balance_at_time=10000,
+        agent_reasoning="test", risk_decision="PASSED",
+        expires_at=datetime.datetime.utcnow() + datetime.timedelta(hours=2)
+    )
+    assert p1.compute_hash() != p2.compute_hash()

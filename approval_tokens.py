@@ -13,21 +13,28 @@ def create_approval_token(
     trade_id: int, 
     proposal_hash: str, 
     policy_version: str,
-    requested_by: str = "ai"
+    requested_by: str = "ai",
+    conn: Optional[sqlite3.Connection] = None
 ) -> Dict[str, Any]:
-    """Create a one‑time token bound to the exact proposal hash."""
+    """Create a one‑time token. If conn is provided, use it (no commit)."""
     token = secrets.token_urlsafe(32)
     expires_at = datetime.utcnow() + timedelta(hours=1)
     
-    conn = sqlite3.connect(DB_PATH)
+    own_conn = False
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        own_conn = True
+    
     cursor = conn.cursor()
     cursor.execute("""
         INSERT INTO approval_tokens 
         (token, trade_id, proposal_hash, policy_version, requested_by, expires_at)
         VALUES (?, ?, ?, ?, ?, ?)
     """, (token, trade_id, proposal_hash, policy_version, requested_by, expires_at.isoformat()))
-    conn.commit()
-    conn.close()
+    
+    if own_conn:
+        conn.commit()
+        conn.close()
     
     return {
         "status": "success",
@@ -38,12 +45,11 @@ def create_approval_token(
         "expires_at": expires_at.isoformat()
     }
 
-def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: str):
     """
     Validates and consumes the token INSIDE an existing transaction.
-    Returns (trade_id, proposal_hash, policy_version) if valid, else (None, None, None).
-    
-    The caller manages the transaction (BEGIN/COMMIT/ROLLBACK).
+    The caller must have begun a transaction (BEGIN EXCLUSIVE) to serialize
+    token consumption and prevent race conditions.
     """
     cursor = conn.cursor()
     

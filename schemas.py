@@ -93,20 +93,23 @@ class TradeProposal(BaseModel):
             raise ValueError(f"Risk {v*100}% exceeds 2% cap")
         return v
     
-    def compute_hash(self) -> str:
-        """Deterministic SHA-256 hash binding ALL materially relevant parameters."""
-        canonical = "|".join([
-            self.chain_id,
-            self.venue,
-            self.wallet_address or "0x",
-            self.asset,
-            self.side.value,
-            str(round(self.entry_price, 6)),
-            str(round(self.stop_loss, 6)),
-            str(round(self.take_profit or 0, 6)),
-            str(round(self.quantity, 8)),
-            str(round(self.risk_percent, 6)),
-            str(round(self.portfolio_balance_at_time, 2)),
-            self.policy_version
-        ])
-        return hashlib.sha256(canonical.encode()).hexdigest()
+
+def compute_hash(self) -> str:
+    """Deterministic SHA-256 hash binding ALL materially relevant parameters."""
+    canonical = "|".join([
+        self.chain_id,
+        self.venue,
+        self.wallet_address or "0x",
+        self.asset,
+        self.side.value,
+        str(round(self.entry_price, 6)),
+        str(round(self.stop_loss, 6)),
+        str(round(self.take_profit or 0, 6)),
+        str(round(self.quantity, 8)),
+        str(round(self.risk_percent, 6)),
+        str(round(self.risk_amount, 8)),           
+        str(round(self.portfolio_balance_at_time, 2)),
+        self.policy_version,
+        self.expires_at.isoformat()                (normalized UTC)
+    ])
+    return hashlib.sha256(canonical.encode()).hexdigest()

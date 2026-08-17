@@ -18,56 +18,78 @@ import trade_memory_mcp
 # STEP 1: REQUEST HUMAN APPROVAL
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Moves trade to AWAITING_APPROVAL, creates a one‑time token bound to the proposal hash."""
-    trade = trade_memory_mcp.get_trade(trade_id)
-    if not trade:
-        return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
-    
-    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
-        return {
-            "status": "ERROR",
-            "reason": f"Trade {trade_id} is '{trade['status']}', must be 'awaiting_approval'."
-        }
-    
-    # Compute proposal hash
-    proposal = TradeProposal(
-        asset=trade["symbol"],
-        side=trade["side"],
-        entry_price=trade["entry_price"],
-        stop_loss=trade["stop_loss"],
-        take_profit=trade.get("take_profit"),
-        quantity=trade["quantity"],
-        risk_percent=trade.get("risk_percent", 0.02),
-        portfolio_balance_at_time=trade["portfolio_balance"],
-        agent_reasoning=trade.get("reasoning", ""),
-        risk_decision="PENDING"
-    )
-    proposal_hash = proposal.compute_hash()
-    policy_version = proposal.policy_version
-    
-    # Store hash and policy version
+    """Atomic: update trade + create token in ONE transaction."""
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("""
-        UPDATE trades 
-        SET proposal_hash = ?, policy_version = ?
-        WHERE id = ?
-    """, (proposal_hash, policy_version, trade_id))
-    conn.commit()
-    conn.close()
+    conn.execute("BEGIN EXCLUSIVE")
     
-    # Create the approval token (bound to hash)
-    token_result = create_approval_token(trade_id, proposal_hash, policy_version, requested_by)
-    
-    return {
-        "status": "success",
-        "trade_id": trade_id,
-        "approval_token": token_result["approval_token"],
-        "expires_at": token_result["expires_at"],
-        "proposal_hash": proposal_hash,
-        "policy_version": policy_version,
-        "message": "Approval requested. Share the token with the human approver."
-    }
+    try:
+        # 1. Fetch the trade
+        trade = trade_memory_mcp.get_trade(trade_id)
+        if not trade:
+            conn.rollback()
+            conn.close()
+            return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
+        
+        if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+            conn.rollback()
+            conn.close()
+            return {
+                "status": "ERROR",
+                "reason": f"Trade {trade_id} is '{trade['status']}', must be 'awaiting_approval'."
+            }
+        
+        # 2. Compute proposal hash
+        proposal = TradeProposal(
+            asset=trade["symbol"],
+            side=trade["side"],
+            entry_price=trade["entry_price"],
+            stop_loss=trade["stop_loss"],
+            take_profit=trade.get("take_profit"),
+            quantity=trade["quantity"],
+            risk_percent=trade.get("risk_percent", 0.02),
+            portfolio_balance_at_time=trade["portfolio_balance"],
+            agent_reasoning=trade.get("reasoning", ""),
+            risk_decision="PENDING"
+        )
+        proposal_hash = proposal.compute_hash()
+        policy_version = proposal.policy_version
+        
+        # 3. Update trade with hash and policy (within the same transaction)
+        cursor = conn.cursor()
+        cursor.execute("""
+            UPDATE trades 
+            SET proposal_hash = ?, policy_version = ?
+            WHERE id = ?
+        """, (proposal_hash, policy_version, trade_id))
+        
+        if cursor.rowcount == 0:
+            conn.rollback()
+            conn.close()
+            return {"status": "ERROR", "reason": "Failed to update trade."}
+        
+        # 4. Create the approval token (also within the same transaction)
+        token_result = create_approval_token(
+            trade_id, proposal_hash, policy_version, requested_by, conn=conn
+        )
+        
+        
+        conn.commit()
+        conn.close()
+        
+        return {
+            "status": "success",
+            "trade_id": trade_id,
+            "approval_token": token_result["approval_token"],
+            "expires_at": token_result["expires_at"],
+            "proposal_hash": proposal_hash,
+            "policy_version": policy_version,
+            "message": "Approval requested."
+        }
+        
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {"status": "ERROR", "reason": str(e)}
 
 # ------------------------------------------------------------------
 # STEP 2: HUMAN APPROVES (ATOMIC: token + hash verification + transition)
