@@ -67,7 +67,9 @@ def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: s
     
     token_id, trade_id, proposal_hash, policy_version, expires_at_str, used_at = row
     expires_at = datetime.fromisoformat(expires_at_str)
-    
+    if expires_at.tzinfo is not None:
+        expires_at = expires_at.replace(tzinfo=None)  # aware → naive UTC
+
     if datetime.utcnow() > expires_at:
         return None, None, None
     if used_at is not None:

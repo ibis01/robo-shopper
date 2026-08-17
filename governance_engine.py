@@ -18,100 +18,76 @@ import trade_memory_mcp
 # STEP 1: REQUEST APPROVAL (auto‑transitions PROPOSED -> AWAITING_APPROVAL)
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Atomic: if trade is PROPOSED, automatically transition to AWAITING_APPROVAL, then create token."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("BEGIN EXCLUSIVE")
-    
+    """Atomic: PROPOSED -> RISK_CHECKED -> AWAITING_APPROVAL, then mint signed token."""
+    # --- Phase 1: state transitions with NO lock held (own connections, like tests) ---
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
+
+    if trade["status"] == TradeStatus.PROPOSED.value:
+        r1 = transition_trade(trade_id, TradeStatus.RISK_CHECKED, ActorType.RISK_ENGINE, {})
+        if r1.get("status") not in ("SUCCESS", "success"):
+            return {"status": "ERROR", "reason": f"RISK_CHECKED failed: {r1}"}
+        r2 = transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE, {})
+        if r2.get("status") not in ("SUCCESS", "success"):
+            return {"status": "ERROR", "reason": f"AWAITING_APPROVAL failed: {r2}"}
+
+    # --- Phase 2: mint token under exclusive lock (single connection only) ---
+    conn = sqlite3.connect(DB_PATH, timeout=10)
     try:
-        trade = trade_memory_mcp.get_trade(trade_id)
-        if not trade:
+        conn.execute("BEGIN EXCLUSIVE")
+        row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        if not row:
             conn.rollback()
-            conn.close()
             return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
-        
+        cols = [c[0] for c in conn.execute("SELECT * FROM trades LIMIT 1").description]
+        trade = dict(zip(cols, row))
         current_status = trade["status"]
-        
-        # If the trade is still PROPOSED, transition it (bypass risk for convenience)
-        if current_status == TradeStatus.PROPOSED.value:
-            transition_trade(trade_id, TradeStatus.RISK_CHECKED, ActorType.RISK_ENGINE, {}, conn=conn)
-            transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE, {}, conn=conn)
-            trade = trade_memory_mcp.get_trade(trade_id)  # refresh
-            current_status = trade["status"]
-        
+
         if current_status != TradeStatus.AWAITING_APPROVAL.value:
             conn.rollback()
-            conn.close()
-            return {
-                "status": "ERROR",
-                "reason": f"Trade {trade_id} is '{current_status}', must be 'awaiting_approval'."
-            }
-        
-        # --- Extract fields (with fallbacks) ---
-        risk_percent = trade.get("risk_percent")
-        if risk_percent is None:
-            entry = trade["entry_price"]
-            stop = trade["stop_loss"]
-            qty = trade["quantity"]
-            balance = trade.get("portfolio_balance", 10000.0)
-            risk_per_unit = abs(entry - stop)
-            risk_amount = risk_per_unit * qty
-            risk_percent = risk_amount / balance if balance > 0 else 0.02
-        
+            return {"status": "ERROR",
+                    "reason": f"Trade {trade_id} is '{current_status}', must be 'awaiting_approval'."}
+
+        entry = trade["entry_price"]; stop = trade["stop_loss"]; qty = trade["quantity"]
+        balance = trade.get("portfolio_balance") or 10000.0
         risk_amount = trade.get("risk_amount")
         if risk_amount is None:
-            entry = trade["entry_price"]
-            stop = trade["stop_loss"]
-            qty = trade["quantity"]
-            risk_per_unit = abs(entry - stop)
-            risk_amount = risk_per_unit * qty
-        
-        portfolio_balance = trade.get("portfolio_balance")
-        if portfolio_balance is None or portfolio_balance <= 0:
-            portfolio_balance = 10000.0
-        
+            risk_amount = abs(entry - stop) * qty
+        risk_percent = trade.get("risk_percent")
+        if risk_percent is None:
+            risk_percent = (risk_amount / balance) if balance > 0 else 0.02
+
         expires_at_str = trade.get("proposal_expires_at")
         if not expires_at_str:
-            expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-            expires_at_str = expires_at.isoformat()
-        else:
-            expires_at = datetime.fromisoformat(expires_at_str)
-        
-        # Build proposal
+            expires_at_str = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+
         proposal = TradeProposal(
             asset=trade["symbol"],
             side=trade["side"],
-            entry_price=trade["entry_price"],
-            stop_loss=trade["stop_loss"],
+            entry_price=entry,
+            stop_loss=stop,
             take_profit=trade.get("take_profit"),
-            quantity=trade["quantity"],
+            quantity=qty,
             risk_percent=risk_percent,
             risk_amount=risk_amount,
-            portfolio_balance_at_time=portfolio_balance,
+            portfolio_balance_at_time=balance,
             agent_reasoning=trade.get("reasoning", ""),
             risk_decision="PENDING",
-            expires_at=expires_at
+            expires_at=datetime.fromisoformat(expires_at_str),
         )
         proposal_hash = proposal.compute_hash()
         policy_version = proposal.policy_version
-        
-        cursor = conn.cursor()
-        cursor.execute("""
-            UPDATE trades 
-            SET proposal_hash = ?, policy_version = ?, proposal_expires_at = ?
-            WHERE id = ?
-        """, (proposal_hash, policy_version, expires_at_str, trade_id))
-        
-        if cursor.rowcount == 0:
+
+        cur = conn.execute(
+            "UPDATE trades SET proposal_hash = ?, policy_version = ?, proposal_expires_at = ? WHERE id = ?",
+            (proposal_hash, policy_version, expires_at_str, trade_id))
+        if cur.rowcount == 0:
             conn.rollback()
-            conn.close()
             return {"status": "ERROR", "reason": "Failed to update trade."}
-        
-        # Create token
+
         token_result = create_approval_token(trade_id, proposal_hash, policy_version, requested_by, conn=conn)
-        
         conn.commit()
-        conn.close()
-        
         return {
             "status": "success",
             "trade_id": trade_id,
@@ -119,17 +95,17 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
             "expires_at": token_result["expires_at"],
             "proposal_hash": proposal_hash,
             "policy_version": policy_version,
-            "message": "Approval requested."
         }
-        
     except Exception as e:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"status": "ERROR", "reason": f"request_approval exception: {e}"}
+    finally:
         conn.close()
-        return {"status": "ERROR", "reason": str(e)}
 
-# ------------------------------------------------------------------
-# STEP 2: APPROVE TRADE (unchanged)
-# ------------------------------------------------------------------
+
 def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str, Any]:
     conn = sqlite3.connect(DB_PATH)
     conn.execute("BEGIN EXCLUSIVE")
@@ -204,13 +180,23 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
 # STEP 3: EXECUTE TRADE (unchanged)
 # ------------------------------------------------------------------
 def execute_trade(
-    trade_id: int, 
+    trade_id: int,
     execution_price: float,
     executed_by: str = "execution_gateway"
 ) -> Dict[str, Any]:
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
+    
+    # IDEMPOTENCY: if already executed, return success
+    if trade["status"] == TradeStatus.EXECUTED.value:
+        return {
+            "status": "SUCCESS",
+            "new_status": TradeStatus.EXECUTED.value,
+            "idempotent": True,
+            "reason": "Trade already executed."
+        }
+    
     if trade["status"] != TradeStatus.APPROVED.value:
         return {"status": "REJECTED", "reason": f"Trade {trade_id} is '{trade['status']}', must be 'approved'."}
     
@@ -218,7 +204,7 @@ def execute_trade(
     if not stored_hash:
         return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    risk_percent = trade.get("risk_percent", 0.02)
+    risk_percent = trade.get("risk_percent") or 0.02
     risk_amount = trade.get("risk_amount")
     if risk_amount is None:
         entry = trade["entry_price"]
@@ -226,7 +212,7 @@ def execute_trade(
         qty = trade["quantity"]
         risk_amount = abs(entry - stop) * qty
     
-    portfolio_balance = trade.get("portfolio_balance", 10000.0)
+    portfolio_balance = trade.get("portfolio_balance") or 10000.0
     expires_at_str = trade.get("proposal_expires_at")
     if not expires_at_str:
         expires_at = datetime.now(timezone.utc) + timedelta(hours=24)

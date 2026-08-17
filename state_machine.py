@@ -167,7 +167,16 @@ def transition_trade(
             "last_modified_at = ?",
             "last_modified_by = ?"
         ]
+        
         params = [target_status.value, datetime.utcnow().isoformat(), actor.value]
+
+        # Add metadata fields that map to real columns (value appended in same order)
+        if metadata:
+            _cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            for key in ["execution_price", "executed_by"]:
+                if key in metadata and key in _cols:
+                    set_clauses.append(f"{key} = ?")
+                    params.append(metadata[key])
         
         status_col_map = {
             TradeStatus.PROPOSED: "proposed_at",
@@ -186,8 +195,8 @@ def transition_trade(
             params.append(json.dumps(metadata))
         
         # WHERE clause: id = ? AND status = ? (atomic)
-        params.append(current_status.value)   # for WHERE status =
         params.append(trade_id)               # for WHERE id =
+        params.append(current_status.value)   # for WHERE status =
         
         query = f"""
             UPDATE trades 

@@ -112,7 +112,7 @@ def test_token_for_wrong_trade_fails(clean_db):
     trade1 = get_trade(tid1)
     assert trade1["status"] == TradeStatus.APPROVED.value
     trade2 = get_trade(tid2)
-    assert trade2["status"] == TradeStatus.AWAITING_APPROVAL.value
+    assert trade2["status"] == TradeStatus.PROPOSED.value  # never requested approval
 
 # ------------------------------------------------------------------
 # TESTS: PROPOSAL TAMPERING
