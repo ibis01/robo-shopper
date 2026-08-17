@@ -45,6 +45,9 @@ def ensure_schema():
             take_profit REAL,
             reasoning TEXT,
             portfolio_balance REAL,
+            risk_percent REAL,
+            risk_amount REAL,
+            proposal_expires_at TIMESTAMP,
             status TEXT,
             created_at TIMESTAMP,
             risk_checked_at TIMESTAMP,
@@ -69,6 +72,9 @@ def ensure_schema():
     existing = [row[1] for row in cursor.fetchall()]
     
     new_cols = {
+        "risk_percent": "REAL",
+        "risk_amount": "REAL",
+        "proposal_expires_at": "TIMESTAMP",
         "proposal_hash": "TEXT",
         "last_modified_by": "TEXT",
         "transition_metadata": "TEXT",
@@ -89,6 +95,8 @@ def ensure_schema():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             token TEXT UNIQUE,
             trade_id INTEGER,
+            proposal_hash TEXT,
+            policy_version TEXT,
             requested_by TEXT,
             expires_at TIMESTAMP,
             used_at TIMESTAMP,

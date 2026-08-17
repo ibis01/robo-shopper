@@ -45,16 +45,16 @@ def create_approval_token(
         "expires_at": expires_at.isoformat()
     }
 
-def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: str):
+def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: str) -> Tuple[Optional[int], Optional[str], Optional[str]]:
     """
     Validates and consumes the token INSIDE an existing transaction.
     The caller must have begun a transaction (BEGIN EXCLUSIVE) to serialize
     token consumption and prevent race conditions.
+    
+    Returns (trade_id, proposal_hash, policy_version) if valid, else (None, None, None).
     """
     cursor = conn.cursor()
     
-    # 1. Select token with FOR UPDATE (locking) to prevent race conditions
-    # SQLite doesn't have SELECT ... FOR UPDATE, but we can use BEGIN EXCLUSIVE.
     cursor.execute("""
         SELECT id, trade_id, proposal_hash, policy_version, expires_at, used_at
         FROM approval_tokens
@@ -68,13 +68,12 @@ def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: s
     token_id, trade_id, proposal_hash, policy_version, expires_at_str, used_at = row
     expires_at = datetime.fromisoformat(expires_at_str)
     
-    # 2. Validate
     if datetime.utcnow() > expires_at:
         return None, None, None
     if used_at is not None:
         return None, None, None
     
-    # 3. Mark as used (atomic update within the same transaction)
+    # Mark as used (atomic update within the same transaction)
     cursor.execute("""
         UPDATE approval_tokens
         SET used_at = ?

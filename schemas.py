@@ -4,7 +4,7 @@ Single source of truth for all data models.
 """
 from pydantic import BaseModel, Field, validator
 from datetime import datetime, timedelta
-from typing import Optional, Literal
+from typing import Optional
 from enum import Enum
 import hashlib
 
@@ -72,7 +72,7 @@ class TradeProposal(BaseModel):
     venue: str = "onchainos"
     wallet_address: Optional[str] = None
     
-    # Expiration
+    # Expiration – deterministic; will be stored and reused
     expires_at: datetime = Field(
         default_factory=lambda: datetime.utcnow() + timedelta(hours=PROPOSAL_EXPIRY_HOURS)
     )
@@ -93,23 +93,29 @@ class TradeProposal(BaseModel):
             raise ValueError(f"Risk {v*100}% exceeds 2% cap")
         return v
     
-
-def compute_hash(self) -> str:
-    """Deterministic SHA-256 hash binding ALL materially relevant parameters."""
-    canonical = "|".join([
-        self.chain_id,
-        self.venue,
-        self.wallet_address or "0x",
-        self.asset,
-        self.side.value,
-        str(round(self.entry_price, 6)),
-        str(round(self.stop_loss, 6)),
-        str(round(self.take_profit or 0, 6)),
-        str(round(self.quantity, 8)),
-        str(round(self.risk_percent, 6)),
-        str(round(self.risk_amount, 8)),           
-        str(round(self.portfolio_balance_at_time, 2)),
-        self.policy_version,
-        self.expires_at.isoformat()                (normalized UTC)
-    ])
-    return hashlib.sha256(canonical.encode()).hexdigest()
+    # ------------------------------------------------------------------
+    # 🔑 Hash computation – correctly indented inside the class
+    # ------------------------------------------------------------------
+    def compute_hash(self) -> str:
+        """
+        Deterministic SHA-256 hash binding ALL materially relevant parameters.
+        The hash is used to cryptographically bind approval to the exact trade details.
+        """
+        # Normalise all numbers to fixed precision to avoid floating-point mismatches.
+        canonical = "|".join([
+            self.chain_id,
+            self.venue,
+            self.wallet_address or "0x",
+            self.asset,
+            self.side.value,
+            str(round(self.entry_price, 6)),
+            str(round(self.stop_loss, 6)),
+            str(round(self.take_profit or 0, 6)),
+            str(round(self.quantity, 8)),
+            str(round(self.risk_percent, 6)),
+            str(round(self.risk_amount, 8)),
+            str(round(self.portfolio_balance_at_time, 2)),
+            self.policy_version,
+            self.expires_at.isoformat()   # normalized UTC
+        ])
+        return hashlib.sha256(canonical.encode()).hexdigest()

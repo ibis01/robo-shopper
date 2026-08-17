@@ -1,6 +1,7 @@
 """
 Robo-Shopper V4 - Centralized Governance Engine (Sprint 5).
-Atomic approval: token consumption + hash verification + state transition in ONE transaction.
+Atomic request_approval(), approve_trade(), execute_trade().
+Proposal expiration is stored and reused for deterministic hashing.
 """
 import sqlite3
 from typing import Dict, Any
@@ -15,15 +16,14 @@ import guardrails_mcp
 import trade_memory_mcp
 
 # ------------------------------------------------------------------
-# STEP 1: REQUEST HUMAN APPROVAL
+# STEP 1: REQUEST APPROVAL (ATOMIC: update trade + create token)
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Atomic: update trade + create token in ONE transaction."""
+    """Atomic: update trade with hash, policy, expiration, and create token in one transaction."""
     conn = sqlite3.connect(DB_PATH)
     conn.execute("BEGIN EXCLUSIVE")
     
     try:
-        # 1. Fetch the trade
         trade = trade_memory_mcp.get_trade(trade_id)
         if not trade:
             conn.rollback()
@@ -38,7 +38,14 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
                 "reason": f"Trade {trade_id} is '{trade['status']}', must be 'awaiting_approval'."
             }
         
-        # 2. Compute proposal hash
+        # Construct proposal with stored expiration
+        stored_expires = trade.get("proposal_expires_at")
+        if not stored_expires:
+            # If missing (old migration), set a default
+            expires_at = datetime.utcnow() + timedelta(hours=24)
+        else:
+            expires_at = datetime.fromisoformat(stored_expires)
+        
         proposal = TradeProposal(
             asset=trade["symbol"],
             side=trade["side"],
@@ -47,31 +54,30 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
             take_profit=trade.get("take_profit"),
             quantity=trade["quantity"],
             risk_percent=trade.get("risk_percent", 0.02),
+            risk_amount=trade.get("risk_amount", 0.0),
             portfolio_balance_at_time=trade["portfolio_balance"],
             agent_reasoning=trade.get("reasoning", ""),
-            risk_decision="PENDING"
+            risk_decision="PENDING",
+            expires_at=expires_at
         )
         proposal_hash = proposal.compute_hash()
         policy_version = proposal.policy_version
+        expires_at_iso = expires_at.isoformat()
         
-        # 3. Update trade with hash and policy (within the same transaction)
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE trades 
-            SET proposal_hash = ?, policy_version = ?
+            SET proposal_hash = ?, policy_version = ?, proposal_expires_at = ?
             WHERE id = ?
-        """, (proposal_hash, policy_version, trade_id))
+        """, (proposal_hash, policy_version, expires_at_iso, trade_id))
         
         if cursor.rowcount == 0:
             conn.rollback()
             conn.close()
             return {"status": "ERROR", "reason": "Failed to update trade."}
         
-        # 4. Create the approval token (also within the same transaction)
-        token_result = create_approval_token(
-            trade_id, proposal_hash, policy_version, requested_by, conn=conn
-        )
-        
+        # Create approval token within the same transaction
+        token_result = create_approval_token(trade_id, proposal_hash, policy_version, requested_by, conn=conn)
         
         conn.commit()
         conn.close()
@@ -92,47 +98,39 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
         return {"status": "ERROR", "reason": str(e)}
 
 # ------------------------------------------------------------------
-# STEP 2: HUMAN APPROVES (ATOMIC: token + hash verification + transition)
+# STEP 2: APPROVE TRADE (ATOMIC: token consumption + hash/policy verification + state transition)
 # ------------------------------------------------------------------
-def approve_trade(approval_token: str, approved_by: str = "human") -> Dict[str, Any]:
+def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str, Any]:
     """
-    Authenticates the human via one‑time token, verifies the hash matches the trade,
-    and transitions to APPROVED – ALL in ONE atomic transaction.
-    
-    The `approved_by` is set by the system (e.g., from authenticated session).
+    Authenticates via one‑time token, verifies hash/policy match, and transitions to APPROVED.
+    All in one database transaction.
     """
     conn = sqlite3.connect(DB_PATH)
-    conn.execute("BEGIN EXCLUSIVE")  # Lock the database for this critical block
+    conn.execute("BEGIN EXCLUSIVE")
     
     try:
-        # 1. Validate and consume token
         trade_id, token_hash, token_policy = validate_and_consume_token_in_transaction(conn, approval_token)
         if trade_id is None:
             conn.rollback()
             conn.close()
-            return {
-                "status": "REJECTED",
-                "reason": "Invalid, expired, or already used approval token."
-            }
+            return {"status": "REJECTED", "reason": "Invalid, expired, or already used token."}
         
-        # 2. Fetch the current trade within the SAME transaction
+        # Fetch trade
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT id, status, proposal_hash, policy_version, entry_price, quantity, stop_loss
+            SELECT id, status, proposal_hash, policy_version, entry_price, quantity, stop_loss,
+                   risk_percent, risk_amount, portfolio_balance, proposal_expires_at, reasoning
             FROM trades WHERE id = ?
         """, (trade_id,))
         row = cursor.fetchone()
-        
         if not row:
             conn.rollback()
             conn.close()
             return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
         
-        trade_status = row[1]
-        trade_hash = row[2]
-        trade_policy = row[3]
+        (_, trade_status, trade_hash, trade_policy, entry, qty, stop,
+         risk_pct, risk_amt, balance, expires_at_str, reasoning) = row
         
-        # 3. Verify current status is AWAITING_APPROVAL
         if trade_status != TradeStatus.AWAITING_APPROVAL.value:
             conn.rollback()
             conn.close()
@@ -141,34 +139,26 @@ def approve_trade(approval_token: str, approved_by: str = "human") -> Dict[str, 
                 "reason": f"Trade {trade_id} is '{trade_status}', must be 'awaiting_approval'."
             }
         
-        # 4. 🔒 CRITICAL: Verify token hash matches the CURRENT trade hash
+        # Verify hash and policy
         if token_hash != trade_hash:
             conn.rollback()
             conn.close()
-            return {
-                "status": "REJECTED",
-                "reason": "PROPOSAL MISMATCH: Token hash does not match current trade hash.",
-                "token_hash": token_hash,
-                "trade_hash": trade_hash
-            }
-        
+            return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: hash differs."}
         if token_policy != trade_policy:
             conn.rollback()
             conn.close()
-            return {
-                "status": "REJECTED",
-                "reason": "POLICY MISMATCH: Token policy version does not match current trade.",
-                "token_policy": token_policy,
-                "trade_policy": trade_policy
-            }
+            return {"status": "REJECTED", "reason": "POLICY MISMATCH."}
         
-        # 5. Transition to APPROVED using the SAME connection
+        # Reconstruct proposal for expiration consistency (not needed here, but for completeness)
+        expires_at = datetime.fromisoformat(expires_at_str) if expires_at_str else datetime.utcnow() + timedelta(hours=24)
+        
+        # Transition using the same connection
         result = transition_trade(
             trade_id,
             TradeStatus.APPROVED,
             ActorType.HUMAN,
             {"approved_by": approved_by, "proposal_hash": token_hash},
-            conn=conn  # Pass the connection to stay in the same transaction
+            conn=conn
         )
         
         if result["status"] != "SUCCESS":
@@ -176,7 +166,6 @@ def approve_trade(approval_token: str, approved_by: str = "human") -> Dict[str, 
             conn.close()
             return result
         
-        # 6. COMMIT everything (token consumed + trade approved)
         conn.commit()
         conn.close()
         
@@ -192,20 +181,17 @@ def approve_trade(approval_token: str, approved_by: str = "human") -> Dict[str, 
     except Exception as e:
         conn.rollback()
         conn.close()
-        return {
-            "status": "ERROR",
-            "reason": f"Approval failed: {str(e)}"
-        }
+        return {"status": "ERROR", "reason": str(e)}
 
 # ------------------------------------------------------------------
-# STEP 3: EXECUTE (requires APPROVED + hash match)
+# STEP 3: EXECUTE TRADE (requires APPROVED + hash match + deterministic expiration)
 # ------------------------------------------------------------------
 def execute_trade(
     trade_id: int, 
     execution_price: float,
     executed_by: str = "execution_gateway"
 ) -> Dict[str, Any]:
-    """Executes a previously approved trade. Actor is strictly EXECUTION_GATEWAY."""
+    """Executes a previously approved trade. Uses stored expiration for deterministic hash."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
@@ -218,12 +204,16 @@ def execute_trade(
     
     stored_hash = trade.get("proposal_hash")
     if not stored_hash:
-        return {
-            "status": "REJECTED",
-            "reason": "No proposal hash. Trade may not have been approved correctly."
-        }
+        return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    # Recompute hash to detect tampering
+    # Retrieve stored expiration
+    stored_expires = trade.get("proposal_expires_at")
+    if not stored_expires:
+        expires_at = datetime.utcnow() + timedelta(hours=24)
+    else:
+        expires_at = datetime.fromisoformat(stored_expires)
+    
+    # Reconstruct proposal with the SAME expiration
     proposal = TradeProposal(
         asset=trade["symbol"],
         side=trade["side"],
@@ -232,9 +222,11 @@ def execute_trade(
         take_profit=trade.get("take_profit"),
         quantity=trade["quantity"],
         risk_percent=trade.get("risk_percent", 0.02),
+        risk_amount=trade.get("risk_amount", 0.0),
         portfolio_balance_at_time=trade["portfolio_balance"],
         agent_reasoning=trade.get("reasoning", ""),
-        risk_decision="PASSED"
+        risk_decision="PASSED",
+        expires_at=expires_at
     )
     computed_hash = proposal.compute_hash()
     
@@ -242,10 +234,11 @@ def execute_trade(
         return {
             "status": "REJECTED",
             "reason": "PROPOSAL TAMPERED: Hash mismatch.",
-            "stored_hash": stored_hash,
-            "computed_hash": computed_hash
+            "stored": stored_hash,
+            "computed": computed_hash
         }
     
+    # Transition via state machine
     result = transition_trade(
         trade_id,
         TradeStatus.EXECUTED,
@@ -261,7 +254,7 @@ def execute_trade(
     return result
 
 # ------------------------------------------------------------------
-# UNIFIED SCREEN (Risk + Guardrails)
+# UNIFIED SCREEN (Risk + Guardrails) – uses state machine internally
 # ------------------------------------------------------------------
 def screen_trade(trade_id: int) -> Dict[str, Any]:
     """Runs Risk Engine + Guardrails on an existing PROPOSED trade."""

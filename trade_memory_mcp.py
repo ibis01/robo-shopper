@@ -12,7 +12,7 @@ from schemas import TradeStatus
 from state_machine import transition_trade, ActorType
 
 # ------------------------------------------------------------------
-# PROPOSE A TRADE (creates initial PROPOSED state)
+# PROPOSE A TRADE (stores risk metrics and expiration)
 # ------------------------------------------------------------------
 def propose_trade(
     symbol: str,
@@ -24,31 +24,31 @@ def propose_trade(
     reasoning: Optional[str] = None,
     portfolio_balance: Optional[float] = None
 ) -> Dict[str, Any]:
-    """Logs a new trade proposal with status = PROPOSED."""
+    """Logs a new trade proposal with status = PROPOSED, storing risk and expiration."""
     if not symbol or not side or quantity <= 0 or entry_price <= 0 or stop_loss <= 0:
         raise ValueError("Invalid trade parameters.")
+    
+    # Compute risk metrics
+    risk_per_unit = abs(entry_price - stop_loss)
+    risk_amount = risk_per_unit * quantity
+    risk_percent = risk_amount / portfolio_balance if portfolio_balance and portfolio_balance > 0 else 0.02
+    
+    # Expiration (24h from now)
+    expires_at = (datetime.utcnow() + timedelta(hours=24)).isoformat()
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT, side TEXT, quantity REAL,
-            entry_price REAL, stop_loss REAL, take_profit REAL,
-            reasoning TEXT, portfolio_balance REAL,
-            status TEXT, created_at TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("""
         INSERT INTO trades (
             symbol, side, quantity, entry_price, stop_loss, take_profit, 
-            reasoning, portfolio_balance, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            reasoning, portfolio_balance, risk_percent, risk_amount, proposal_expires_at,
+            status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         symbol, side, quantity, entry_price, stop_loss, take_profit,
-        reasoning, portfolio_balance, TradeStatus.PROPOSED.value, datetime.utcnow().isoformat()
+        reasoning, portfolio_balance, risk_percent, risk_amount, expires_at,
+        TradeStatus.PROPOSED.value, datetime.utcnow().isoformat()
     ))
     
     trade_id = cursor.lastrowid
@@ -101,7 +101,7 @@ def get_trade_history(limit: int = 10) -> Dict[str, Any]:
     return {"trades": trades, "count": len(trades)}
 
 # ------------------------------------------------------------------
-# DEPRECATED: record_execution (kept for backward compatibility, but now uses state_machine)
+# DEPRECATED: record_execution (kept for backward compatibility, now uses state_machine)
 # ------------------------------------------------------------------
 def record_execution(trade_id: int, execution_price: float, feedback: Optional[str] = None):
     """Deprecated: Use execute_trade() from governance_engine instead."""
