@@ -13,7 +13,6 @@ import mcp.types as types
 
 # --- Import all MCP modules ---
 import market_intelligence_mcp
-# import finance_copilot_skills_mcp   # <-- MISSING – commented out for now
 import trade_memory_mcp
 import risk_management_mcp
 import onchain_execution_mcp
@@ -58,7 +57,6 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol"]
             }
         ),
-        # ---------- DERIVATIVES (currently disabled because finance_copilot_skills_mcp is missing) ----------
         # types.Tool(
         #     name="get_derivatives_context",
         #     description="Fetch OKX perpetual funding rates and open interest",
@@ -222,7 +220,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
         # ---------- DERIVATIVES (disabled) ----------
         # elif name == "get_derivatives_context":
-        #     result = finance_copilot_skills_mcp.get_derivatives_context(args.get("symbol"))
 
         # ---------- RISK & GOVERNANCE ----------
         elif name == "calculate_position_size":
