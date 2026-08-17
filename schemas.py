@@ -3,7 +3,7 @@ Robo-Shopper V4 - Formal Governance Schemas (Sprint 5).
 Single source of truth for all data models.
 """
 from pydantic import BaseModel, Field, validator
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta, timezone
 from typing import Optional
 from enum import Enum
 import hashlib
@@ -74,7 +74,7 @@ class TradeProposal(BaseModel):
     
     # Expiration – deterministic; will be stored and reused
     expires_at: datetime = Field(
-        default_factory=lambda: datetime.utcnow() + timedelta(hours=PROPOSAL_EXPIRY_HOURS)
+        default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=PROPOSAL_EXPIRY_HOURS)
     )
     
     # --- Validators ---

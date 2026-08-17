@@ -4,7 +4,7 @@ Transaction‑aware token validation for atomic approval.
 """
 import secrets
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta, timezone
 from typing import Optional, Dict, Any, Tuple
 
 from config import DB_PATH
@@ -18,7 +18,7 @@ def create_approval_token(
 ) -> Dict[str, Any]:
     """Create a one‑time token. If conn is provided, use it (no commit)."""
     token = secrets.token_urlsafe(32)
-    expires_at = datetime.utcnow() + timedelta(hours=1)
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     
     own_conn = False
     if conn is None:
@@ -67,10 +67,12 @@ def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: s
     
     token_id, trade_id, proposal_hash, policy_version, expires_at_str, used_at = row
     expires_at = datetime.fromisoformat(expires_at_str)
-    if expires_at.tzinfo is not None:
-        expires_at = expires_at.replace(tzinfo=None)  # aware → naive UTC
-
-    if datetime.utcnow() > expires_at:
+    # Normalize: if stored as naive, assume UTC (make aware for comparison)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    
+    # Both sides now aware — safe to compare
+    if datetime.now(timezone.utc) > expires_at:
         return None, None, None
     if used_at is not None:
         return None, None, None
@@ -80,7 +82,7 @@ def validate_and_consume_token_in_transaction(conn: sqlite3.Connection, token: s
         UPDATE approval_tokens
         SET used_at = ?
         WHERE id = ? AND used_at IS NULL
-    """, (datetime.utcnow().isoformat(), token_id))
+    """, (datetime.now(timezone.utc).isoformat(), token_id))
     
     if cursor.rowcount == 0:
         return None, None, None

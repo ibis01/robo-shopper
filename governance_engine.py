@@ -142,19 +142,49 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         # TOKEN HASH == TRADE HASH == COMPUTED HASH
         # For hash verification, use defensive defaults if values are None
         # (actual execution will fail-closed, but hash verification needs complete data)
+        # Fail closed: reject if any authorization field is missing
+        if not symbol:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "Missing symbol in trade record."}
+        if not side:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "Missing side in trade record."}
+        if risk_pct is None:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "Missing risk_percent in trade record."}
+        if risk_amt is None:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "Missing risk_amount in trade record."}
+        if balance is None:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "Missing portfolio_balance in trade record."}
+        if not expires_at_str:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "Missing proposal expiration."}
+        
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+
         proposal = TradeProposal(
-            asset=symbol or "BTC",
-            side=side or "long",
+            asset=symbol,
+            side=side,
             entry_price=entry,
             stop_loss=stop,
             take_profit=take_profit,
             quantity=qty,
-            risk_percent=risk_pct or 0.02,
-            risk_amount=risk_amt or (abs(entry - stop) * qty),
-            portfolio_balance_at_time=balance or 10000.0,
+            risk_percent=risk_pct,
+            risk_amount=risk_amt,
+            portfolio_balance_at_time=balance,
             agent_reasoning=reasoning or "",
             risk_decision="PASSED",
-            expires_at=datetime.fromisoformat(expires_at_str) if expires_at_str else datetime.now(timezone.utc) + timedelta(hours=24)
+            expires_at=datetime.fromisoformat(expires_at_str)
         )
         computed_hash = proposal.compute_hash()
         
@@ -245,6 +275,10 @@ def execute_trade(
     if not expires_at_str:
         return {"status": "REJECTED", "reason": "Trade has no expiration set."}
     expires_at = datetime.fromisoformat(expires_at_str)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
     
     proposal = TradeProposal(
         asset=trade["symbol"],

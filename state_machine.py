@@ -5,7 +5,7 @@ Supports external connections for atomic transactions.
 """
 import sqlite3
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 
 from config import DB_PATH
@@ -168,7 +168,7 @@ def transition_trade(
             "last_modified_by = ?"
         ]
         
-        params = [target_status.value, datetime.utcnow().isoformat(), actor.value]
+        params = [target_status.value, datetime.now(timezone.utc).isoformat(), actor.value]
 
         # Add metadata fields that map to real columns (value appended in same order)
         if metadata:
@@ -188,7 +188,7 @@ def transition_trade(
         }
         if target_status in status_col_map:
             set_clauses.append(f"{status_col_map[target_status]} = ?")
-            params.append(datetime.utcnow().isoformat())
+            params.append(datetime.now(timezone.utc).isoformat())
         
         if metadata:
             set_clauses.append("transition_metadata = ?")
@@ -227,7 +227,7 @@ def transition_trade(
             "new_status": target_status.value,
             "actor": actor.value,
             "message": f"Trade {trade_id} → {target_status.value} by {actor.value}.",
-            "timestamp": datetime.utcnow().isoformat()
+            "timestamp": datetime.now(timezone.utc).isoformat()
         }
         
     except Exception as e:
