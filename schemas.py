@@ -1,13 +1,16 @@
 """
 Robo-Shopper V4 - Formal Governance Schemas (Sprint 5).
-Moves the system from loose dictionaries to strict, validated data models.
+Single source of truth for all data models.
 """
 from pydantic import BaseModel, Field, validator
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Optional, Literal
 from enum import Enum
+import hashlib
 
-# --- Enums for strict state management ---
+from config import POLICY_VERSION, PROPOSAL_EXPIRY_HOURS
+
+# --- Enums ---
 class TradeStatus(str, Enum):
     ANALYZING = "analyzing"
     PROPOSED = "proposed"
@@ -21,61 +24,89 @@ class TradeStatus(str, Enum):
 class TradeSide(str, Enum):
     LONG = "long"
     SHORT = "short"
-    
-class TradeProposal(BaseModel):
-    # ... existing fields
-    proposal_hash: Optional[str] = Field(None, description="SHA256 hash of canonical trade for approval binding")
-    
-    def compute_hash(self) -> str:
-        """Computes a deterministic hash of the trade proposal."""
-        import hashlib
-        canonical = f"{self.asset}|{self.side}|{self.entry_price}|{self.stop_loss}|{self.take_profit}|{self.quantity}"
-        return hashlib.sha256(canonical.encode()).hexdigest()
 
-# --- The Core Trade Proposal Object ---
+class ActorType(str, Enum):
+    SYSTEM = "system"
+    AI = "ai"
+    HUMAN = "human"
+    RISK_ENGINE = "risk_engine"
+    GUARDRAIL = "guardrail"
+    EXECUTION_GATEWAY = "execution_gateway"
+
+# --- The Core Trade Proposal (SINGLE DEFINITION) ---
 class TradeProposal(BaseModel):
     # Metadata
     id: Optional[int] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    asset: str = Field(..., description="Trading pair, e.g., BTC, ETH")
+    asset: str
     side: TradeSide
     
-    # Price levels
-    entry_price: float = Field(gt=0, description="Proposed entry price")
-    stop_loss: float = Field(gt=0, description="Stop loss price")
-    take_profit: Optional[float] = Field(None, gt=0, description="Take profit price (optional)")
+    # Prices
+    entry_price: float = Field(gt=0)
+    stop_loss: float = Field(gt=0)
+    take_profit: Optional[float] = Field(None, gt=0)
     
-    # Risk calculations (deterministic)
-    position_size: float = Field(gt=0, description="Quantity to trade")
-    risk_amount: float = Field(gt=0, description="Dollar amount at risk")
-    risk_percent: float = Field(le=0.02, description="Risk as % of portfolio (must be <= 2%)")
-    portfolio_balance_at_time: float = Field(gt=0, description="Portfolio balance used for sizing")
+    # Sizing & Risk
+    quantity: float = Field(gt=0)
+    risk_amount: float = Field(gt=0)
+    risk_percent: float = Field(le=0.02)
+    portfolio_balance_at_time: float = Field(gt=0)
     
-    # Governance context
-    market_snapshot: dict = Field(default_factory=dict, description="Technical indicators at proposal time")
-    agent_reasoning: str = Field(..., description="The LLM's rationale for the trade")
-    risk_decision: str = Field(..., description="PASSED or REJECTED by the risk engine")
+    # Governance
+    market_snapshot: dict = Field(default_factory=dict)
+    agent_reasoning: str
+    risk_decision: str
     
-    # Human-in-the-loop
+    # Human approval
     human_approval: Optional[bool] = None
     approval_timestamp: Optional[datetime] = None
     
-    # Execution tracking
+    # Execution
     execution_status: TradeStatus = Field(default=TradeStatus.PROPOSED)
     transaction_hash: Optional[str] = None
     
-    # --- Validators to catch bad trades before they reach the LLM ---
+    # --- SECURITY: Proposal hash & policy binding ---
+    proposal_hash: Optional[str] = None
+    policy_version: str = POLICY_VERSION
+    chain_id: str = "x-layer"
+    venue: str = "onchainos"
+    wallet_address: Optional[str] = None
+    
+    # Expiration
+    expires_at: datetime = Field(
+        default_factory=lambda: datetime.utcnow() + timedelta(hours=PROPOSAL_EXPIRY_HOURS)
+    )
+    
+    # --- Validators ---
     @validator('stop_loss')
     def validate_stop(cls, v, values):
         if 'side' in values and 'entry_price' in values:
             if values['side'] == TradeSide.LONG and v >= values['entry_price']:
-                raise ValueError("Stop loss must be BELOW entry price for LONG trades")
+                raise ValueError("Stop loss must be BELOW entry for LONG")
             if values['side'] == TradeSide.SHORT and v <= values['entry_price']:
-                raise ValueError("Stop loss must be ABOVE entry price for SHORT trades")
+                raise ValueError("Stop loss must be ABOVE entry for SHORT")
         return v
 
     @validator('risk_percent')
     def validate_risk(cls, v):
         if v > 0.02:
-            raise ValueError(f"Risk per trade cannot exceed 2%! Got {v*100}%")
+            raise ValueError(f"Risk {v*100}% exceeds 2% cap")
         return v
+    
+    def compute_hash(self) -> str:
+        """Deterministic SHA-256 hash binding ALL materially relevant parameters."""
+        canonical = "|".join([
+            self.chain_id,
+            self.venue,
+            self.wallet_address or "0x",
+            self.asset,
+            self.side.value,
+            str(round(self.entry_price, 6)),
+            str(round(self.stop_loss, 6)),
+            str(round(self.take_profit or 0, 6)),
+            str(round(self.quantity, 8)),
+            str(round(self.risk_percent, 6)),
+            str(round(self.portfolio_balance_at_time, 2)),
+            self.policy_version
+        ])
+        return hashlib.sha256(canonical.encode()).hexdigest()
