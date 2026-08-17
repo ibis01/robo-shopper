@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from schemas import TradeStatus, ActorType, TradeSide
 from state_machine import transition_trade
+from tests.test_helpers import screen_and_request_approval
 from governance_engine import request_approval, approve_trade, execute_trade
 from trade_memory_mcp import propose_trade, get_trade
 from config import DB_PATH
@@ -34,9 +35,20 @@ def clean_db():
     conn.close()
 
 
-def create_proposed_trade(symbol="BTC", side="long", quantity=0.4, entry=60000, stop=59500):
+def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000, stop=59500):
     prop = propose_trade(symbol, side, quantity, entry, stop, reasoning="test")
     return prop["trade_id"]
+    
+    # Set realistic portfolio_balance for exposure calculations
+    import sqlite3
+    from config import DB_PATH
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE trades SET portfolio_balance = 10000.0 WHERE id = ?",
+        (prop["trade_id"],)
+    )
+    conn.commit()
+    conn.close()
 
 
 # ------------------------------------------------------------------
@@ -44,14 +56,14 @@ def create_proposed_trade(symbol="BTC", side="long", quantity=0.4, entry=60000, 
 # ------------------------------------------------------------------
 def test_ai_cannot_approve(clean_db):
     tid = create_proposed_trade()
-    request_approval(tid)  # now automatically transitions to AWAITING_APPROVAL
+    screen_and_request_approval(tid)  # proper governance flow
     result = transition_trade(tid, TradeStatus.APPROVED, ActorType.AI)
     assert result["status"] == "REJECTED"
     assert "UNAUTHORIZED" in result["message"]
 
 def test_system_cannot_approve(clean_db):
     tid = create_proposed_trade()
-    request_approval(tid)
+    screen_and_request_approval(tid)
     result = transition_trade(tid, TradeStatus.APPROVED, ActorType.SYSTEM)
     assert result["status"] == "REJECTED"
     assert "UNAUTHORIZED" in result["message"]
@@ -78,7 +90,7 @@ def test_wrong_token_fails(clean_db):
 
 def test_expired_token_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     conn = sqlite3.connect(DB_PATH)
@@ -93,7 +105,7 @@ def test_expired_token_fails(clean_db):
 
 def test_replayed_token_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     res1 = approve_trade(token)
@@ -105,7 +117,7 @@ def test_replayed_token_fails(clean_db):
 def test_token_for_wrong_trade_fails(clean_db):
     tid1 = create_proposed_trade()
     tid2 = create_proposed_trade(symbol="ETH", entry=3000, stop=2950)
-    req1 = request_approval(tid1)
+    req1 = screen_and_request_approval(tid1)
     assert req1["status"] == "success"
     token1 = req1["approval_token"]
     approve_trade(token1)
@@ -119,7 +131,7 @@ def test_token_for_wrong_trade_fails(clean_db):
 # ------------------------------------------------------------------
 def test_modified_quantity_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     approve_trade(token)
@@ -134,7 +146,7 @@ def test_modified_quantity_fails(clean_db):
 
 def test_modified_entry_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     approve_trade(token)
@@ -149,7 +161,7 @@ def test_modified_entry_fails(clean_db):
 
 def test_modified_policy_version_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     conn = sqlite3.connect(DB_PATH)
@@ -173,7 +185,7 @@ def test_rejected_trade_cannot_execute(clean_db):
 
 def test_double_execution_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     approve_trade(token)
@@ -193,7 +205,7 @@ def test_awaiting_approval_cannot_execute(clean_db):
 
 def test_modified_risk_amount_fails(clean_db):
     tid = create_proposed_trade()
-    req = request_approval(tid)
+    req = screen_and_request_approval(tid)
     assert req["status"] == "success"
     token = req["approval_token"]
     approve_trade(token)

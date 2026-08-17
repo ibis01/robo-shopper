@@ -19,18 +19,17 @@ import trade_memory_mcp
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
     """Atomic: PROPOSED -> RISK_CHECKED -> AWAITING_APPROVAL, then mint signed token."""
-    # --- Phase 1: state transitions with NO lock held (own connections, like tests) ---
+    # --- Phase 1: verify trade has been screened ---
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
 
-    if trade["status"] == TradeStatus.PROPOSED.value:
-        r1 = transition_trade(trade_id, TradeStatus.RISK_CHECKED, ActorType.RISK_ENGINE, {})
-        if r1.get("status") not in ("SUCCESS", "success"):
-            return {"status": "ERROR", "reason": f"RISK_CHECKED failed: {r1}"}
-        r2 = transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE, {})
-        if r2.get("status") not in ("SUCCESS", "success"):
-            return {"status": "ERROR", "reason": f"AWAITING_APPROVAL failed: {r2}"}
+    # Enforcement: trade MUST already be AWAITING_APPROVAL (meaning screen_trade() passed)
+    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+        return {
+            "status": "REJECTED",
+            "reason": f"Trade {trade_id} is '{trade['status']}'. Must call screen_trade() first."
+        }
 
     # --- Phase 2: mint token under exclusive lock (single connection only) ---
     conn = sqlite3.connect(DB_PATH, timeout=10)
@@ -60,7 +59,8 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
 
         expires_at_str = trade.get("proposal_expires_at")
         if not expires_at_str:
-            expires_at_str = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
+            conn.rollback()
+            return {"status": "REJECTED", "reason": "Trade has no expiration set."}
 
         proposal = TradeProposal(
             asset=trade["symbol"],
@@ -285,8 +285,8 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.GUARDRAIL, {"exposure_result": exposure})
         return {"status": "REJECTED", "trade_id": trade_id, "reason": exposure["reason"], "stage": "exposure_guardrail"}
     
-    breaker = guardrails_mcp.check_circuit_breaker()
-    if breaker["status"] == "TRIPPED":
+    breaker = guardrails_mcp.check_circuit_breaker() or {"status": "OK", "reason": "No circuit breaker state"}
+    if breaker.get("status") == "TRIPPED":
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.GUARDRAIL, {"breaker_result": breaker})
         return {"status": "REJECTED", "trade_id": trade_id, "reason": breaker["reason"], "stage": "circuit_breaker"}
     
@@ -294,7 +294,7 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
     transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE)
     
     return {
-        "status": "PASSED",
+        "status": "SUCCESS",
         "trade_id": trade_id,
         "message": "Passed all gates. Awaiting human approval.",
         "risk_check": risk_result,
