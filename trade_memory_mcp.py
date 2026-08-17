@@ -4,7 +4,7 @@ Manages the SQLite ledger.
 State mutations are delegated to state_machine.py.
 """
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 from config import DB_PATH
@@ -12,7 +12,7 @@ from schemas import TradeStatus
 from state_machine import transition_trade, ActorType
 
 # ------------------------------------------------------------------
-# PROPOSE A TRADE (stores risk metrics and expiration)
+# PROPOSE A TRADE
 # ------------------------------------------------------------------
 def propose_trade(
     symbol: str,
@@ -33,8 +33,8 @@ def propose_trade(
     risk_amount = risk_per_unit * quantity
     risk_percent = risk_amount / portfolio_balance if portfolio_balance and portfolio_balance > 0 else 0.02
     
-    # Expiration (24h from now)
-    expires_at = (datetime.utcnow() + timedelta(hours=24)).isoformat()
+    # Expiration (24h from now) – use timezone-aware UTC
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -48,7 +48,7 @@ def propose_trade(
     """, (
         symbol, side, quantity, entry_price, stop_loss, take_profit,
         reasoning, portfolio_balance, risk_percent, risk_amount, expires_at,
-        TradeStatus.PROPOSED.value, datetime.utcnow().isoformat()
+        TradeStatus.PROPOSED.value, datetime.now(timezone.utc).isoformat()
     ))
     
     trade_id = cursor.lastrowid
@@ -101,16 +101,15 @@ def get_trade_history(limit: int = 10) -> Dict[str, Any]:
     return {"trades": trades, "count": len(trades)}
 
 # ------------------------------------------------------------------
-# DEPRECATED: record_execution (kept for backward compatibility, now uses state_machine)
+# DEPRECATED: record_execution
 # ------------------------------------------------------------------
 def record_execution(trade_id: int, execution_price: float, feedback: Optional[str] = None):
     """Deprecated: Use execute_trade() from governance_engine instead."""
-    # Redirect to the state machine
     result = transition_trade(
         trade_id,
         TradeStatus.EXECUTED,
         ActorType.EXECUTION_GATEWAY,
         {"execution_price": execution_price, "feedback": feedback},
-        require_approval_hash="legacy"  # This will fail if not properly approved
+        require_approval_hash="legacy"
     )
     return result

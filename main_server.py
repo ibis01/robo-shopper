@@ -13,12 +13,12 @@ import mcp.types as types
 
 # --- Import all MCP modules ---
 import market_intelligence_mcp
-import finance_copilot_skills_mcp   # Derivatives context (funding/OI)
+# import finance_copilot_skills_mcp   # <-- MISSING – commented out for now
 import trade_memory_mcp
 import risk_management_mcp
 import onchain_execution_mcp
 import proactive_alerts_mcp
-import guardrails_mcp  # <-- ADDED for screen_trade
+import guardrails_mcp
 
 # --- V4 New MCPs ---
 import options_mcp
@@ -33,33 +33,19 @@ server = Server("robo-shopper-universal")
 # ------------------------------------------------------------------
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
-    return [
+    tools = [
         # ---------- UNIFIED VETO GATE ----------
-        
-      types.Tool(
-         name="screen_trade",
-         description="UNIFIED VETO GATE: Runs an existing trade proposal (by ID) through Risk Engine + Portfolio Guardrails + Circuit Breaker. Updates the trade state to AWAITING_APPROVAL if PASSED, or REJECTED if failed. This is the FINAL arbiter.",
-         inputSchema={
-           "type": "object",
-           "properties": {
-            "trade_id": {"type": "integer", "description": "The ID of the trade proposal to screen."}
-        },
-        "required": ["trade_id"]
-    }
-),
-           types.Tool(
-    name="approve_and_execute",
-    description="Human action: Approves a trade and records its execution with the actual fill price.",
-    inputSchema={
-        "type": "object",
-        "properties": {
-            "trade_id": {"type": "integer"},
-            "execution_price": {"type": "number"},
-            "approved_by": {"type": "string", "default": "human"}
-        },
-        "required": ["trade_id", "execution_price"]
-    }
-),
+        types.Tool(
+            name="screen_trade",
+            description="UNIFIED VETO GATE: Runs an existing trade proposal (by ID) through Risk Engine + Portfolio Guardrails + Circuit Breaker. Updates the trade state to AWAITING_APPROVAL if PASSED, or REJECTED if failed. This is the FINAL arbiter.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "trade_id": {"type": "integer", "description": "The ID of the trade proposal to screen."}
+                },
+                "required": ["trade_id"]
+            }
+        ),
         # ---------- MARKET INTELLIGENCE ----------
         types.Tool(
             name="analyze_technicals",
@@ -72,18 +58,18 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol"]
             }
         ),
-        types.Tool(
-            name="get_derivatives_context",
-            description="Fetch OKX perpetual funding rates and open interest",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string", "enum": ["BTC", "ETH", "SOL"]}
-                },
-                "required": ["symbol"]
-            }
-        ),
-
+        # ---------- DERIVATIVES (currently disabled because finance_copilot_skills_mcp is missing) ----------
+        # types.Tool(
+        #     name="get_derivatives_context",
+        #     description="Fetch OKX perpetual funding rates and open interest",
+        #     inputSchema={
+        #         "type": "object",
+        #         "properties": {
+        #             "symbol": {"type": "string", "enum": ["BTC", "ETH", "SOL"]}
+        #         },
+        #         "required": ["symbol"]
+        #     }
+        # ),
         # ---------- RISK & GOVERNANCE (HARDENED) ----------
         types.Tool(
             name="calculate_position_size",
@@ -114,7 +100,6 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol", "side", "entry", "stop", "size"]
             }
         ),
-
         # ---------- MEMORY & LEDGER ----------
         types.Tool(
             name="get_trade_history",
@@ -143,7 +128,6 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol", "side", "size", "entry", "stop"]
             }
         ),
-
         # ---------- EXECUTION (DRY-RUN ONLY) ----------
         types.Tool(
             name="format_onchainos_command",
@@ -159,7 +143,6 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol", "side", "amount"]
             }
         ),
-
         # ---------- V4: OPTIONS (Deribit) ----------
         types.Tool(
             name="get_deribit_summary",
@@ -183,7 +166,6 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["currency"]
             }
         ),
-
         # ---------- V4: PREDICTION MARKETS (Polymarket) ----------
         types.Tool(
             name="get_polymarket_markets",
@@ -206,7 +188,6 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["slug"]
             }
         ),
-
         # ---------- V4: NEWS & SENTIMENT ----------
         types.Tool(
             name="get_crypto_sentiment",
@@ -219,6 +200,7 @@ async def handle_list_tools() -> list[types.Tool]:
             }
         ),
     ]
+    return tools
 
 # ------------------------------------------------------------------
 # 2. TOOL ROUTING (Executes the actual logic)
@@ -227,61 +209,21 @@ async def handle_list_tools() -> list[types.Tool]:
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
     args = arguments or {}
     result = None
-    
+
     try:
         # ---------- UNIFIED SCREEN ----------
         if name == "screen_trade":
-            # Step 1: Core risk check
-            risk_result = risk_management_mcp.evaluate_trade_risk(
-                symbol=args.get("symbol"),
-                side=args.get("side"),
-                entry=args.get("entry_price"),
-                stop=args.get("stop_loss"),
-                size=args.get("quantity"),
-                portfolio_balance=args.get("portfolio_balance")
-            )
-            if risk_result["status"] == "REJECTED":
-                result = risk_result
-            else:
-                # Step 2: Portfolio guardrails
-                exposure = guardrails_mcp.check_exposure_limit(
-                    args.get("quantity"), 
-                    args.get("entry_price")
-                )
-                if exposure["status"] == "REJECTED":
-                    result = exposure
-                else:
-                    breaker = guardrails_mcp.check_circuit_breaker()
-                    if breaker["status"] == "TRIPPED":
-                        result = breaker
-                    else:
-                        # All passed
-                        result = {
-                            "status": "PASSED",
-                            "risk_check": risk_result,
-                            "exposure_check": exposure,
-                            "circuit_breaker": breaker,
-                            "message": "Trade passed ALL governance gates."
-                        }
+            from governance_engine import screen_trade
+            result = screen_trade(args.get("trade_id"))
 
-elif name == "screen_trade":
-    from governance_engine import screen_trade
-    result = screen_trade(args.get("trade_id"))
-
-elif name == "approve_and_execute":
-    from governance_engine import approve_and_execute_trade
-    result = approve_and_execute_trade(
-        trade_id=args.get("trade_id"),
-        execution_price=args.get("execution_price"),
-        approved_by=args.get("approved_by", "human")
-    )
         # ---------- MARKET INTELLIGENCE ----------
         elif name == "analyze_technicals":
             result = market_intelligence_mcp.analyze_technicals(args.get("symbol"))
-            
-        elif name == "get_derivatives_context":
-            result = finance_copilot_skills_mcp.get_derivatives_context(args.get("symbol"))
-        
+
+        # ---------- DERIVATIVES (disabled) ----------
+        # elif name == "get_derivatives_context":
+        #     result = finance_copilot_skills_mcp.get_derivatives_context(args.get("symbol"))
+
         # ---------- RISK & GOVERNANCE ----------
         elif name == "calculate_position_size":
             result = risk_management_mcp.calculate_position_size(
@@ -289,7 +231,7 @@ elif name == "approve_and_execute":
                 stop=args.get("stop"),
                 portfolio_balance=args.get("portfolio_balance")
             )
-            
+
         elif name == "evaluate_trade_risk":
             result = risk_management_mcp.evaluate_trade_risk(
                 symbol=args.get("symbol"),
@@ -299,22 +241,22 @@ elif name == "approve_and_execute":
                 size=args.get("size"),
                 portfolio_balance=args.get("portfolio_balance")
             )
-        
+
         # ---------- MEMORY ----------
         elif name == "get_trade_history":
             result = trade_memory_mcp.get_trade_history(args.get("limit", 10))
-            
+
         elif name == "propose_trade":
             result = trade_memory_mcp.propose_trade(
                 symbol=args.get("symbol"),
                 side=args.get("side"),
-                quantity=args.get("size"),   # map 'size' to 'quantity'
+                quantity=args.get("size"),
                 entry_price=args.get("entry"),
                 stop_loss=args.get("stop"),
                 take_profit=args.get("take_profit"),
                 reasoning=args.get("reasoning", "Proposed by LLM")
             )
-        
+
         # ---------- EXECUTION ----------
         elif name == "format_onchainos_command":
             result = onchain_execution_mcp.format_onchainos_command(
@@ -323,31 +265,31 @@ elif name == "approve_and_execute":
                 amount=args.get("amount"),
                 slippage=args.get("slippage", 0.5)
             )
-        
+
         # ---------- OPTIONS ----------
         elif name == "get_deribit_summary":
             result = options_mcp.get_deribit_summary(args.get("currency", "BTC"))
-            
+
         elif name == "suggest_option_strategy":
             result = options_mcp.suggest_option_strategy(
                 currency=args.get("currency", "BTC"),
                 sentiment=args.get("sentiment", "neutral")
             )
-        
+
         # ---------- PREDICTION MARKETS ----------
         elif name == "get_polymarket_markets":
             result = prediction_mcp.get_polymarket_markets(args.get("limit", 5))
-            
+
         elif name == "verify_prediction_odds":
             result = prediction_mcp.verify_prediction_odds(args.get("slug"))
-        
+
         # ---------- NEWS ----------
         elif name == "get_crypto_sentiment":
             result = news_mcp.get_crypto_sentiment(args.get("coin", "BTC"))
-        
+
         else:
             result = f"ERROR: Unknown tool '{name}'"
-            
+
     except Exception as e:
         # Catch Hard Stop errors from risk engine and propagate them
         result = f"HARD STOP: {str(e)}"
@@ -355,7 +297,7 @@ elif name == "approve_and_execute":
     # Ensure result is a string (MCP expects text content)
     if not isinstance(result, str):
         result = json.dumps(result, indent=2)
-        
+
     return [types.TextContent(type="text", text=str(result))]
 
 # ------------------------------------------------------------------

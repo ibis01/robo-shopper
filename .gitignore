@@ -17,3 +17,6 @@ ngrok
 trades.db
 __pycache__/
 *.pyc
+venv/
+robo-shopper/
+scripts/
