@@ -1,94 +1,125 @@
-"""Robo-Shopper V4 - Portfolio-level guardrails (Sprint 1)."""
+"""
+Robo-Shopper V4 - Portfolio Guardrails (Sprint 5).
+Enforces circuit breakers, exposure limits, and correlation checks.
+USES THE SAME SOURCE OF TRUTH for portfolio balance as the risk engine.
+"""
 import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from typing import Dict, Any, List, Optional
 
-from mcp.server.fastmcp import FastMCP
+# --- IMPORT THE REAL BALANCE FETCHER (NO MOCKS) ---
+from risk_management_mcp import _get_real_portfolio_balance
 
-BASE = os.path.dirname(os.path.abspath(__file__))
-DB = os.path.join(BASE, "trades.db")
+# Constants (using DECIMAL convention: 0.02 = 2%)
+MAX_DAILY_DRAWDOWN = 0.05      # 5%
+MAX_OPEN_EXPOSURE = 0.20       # 20%
+CORE_ASSETS = ["BTC", "ETH", "SOL"]
 
-PORTFOLIO_BALANCE = 10000.0
-MAX_EXPOSURE_PCT = 20.0
-DRAWDOWN_LIMIT_PCT = 5.0
-ATR_STOP_MULT = 1.5
-MAJORS = {"BTC", "ETH", "SOL"}
+def _get_open_positions() -> List[Dict[str, Any]]:
+    """Fetches currently open positions from the trades ledger."""
+    db_path = os.path.join(os.path.dirname(__file__), "data", "trades.db")
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT symbol, side, entry_price, position_size 
+            FROM trades 
+            WHERE status NOT IN ('closed', 'rejected', 'proposed')
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        return [{"symbol": r[0], "side": r[1], "entry": r[2], "size": r[3]} for r in rows]
+    except:
+        return []
 
-
-def _conn():
-    return sqlite3.connect(DB)
-
-
-def _base(symbol):
-    return symbol.replace("USDT", "").replace("USD", "").split("-")[0].upper()
-
-
-def _open_positions(con):
-    return con.execute(
-        "SELECT symbol, COALESCE(proposed_amount,0) * COALESCE(actual_entry_price, proposed_price,0) "
-        "FROM trades WHERE status NOT IN ('closed','proposed','rejected')"
-    ).fetchall()
-
-
-def _daily_pnl(con):
-    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
-    return con.execute(
-        "SELECT COALESCE(SUM(pnl),0) FROM trades WHERE status='closed' AND closed_at >= ?",
-        (cutoff,)).fetchone()[0]
-
-
-def register(mcp: FastMCP):
-
-    @mcp.tool()
-    def get_guard_status() -> dict:
-        """Portfolio guardrails: circuit breaker state, exposure cap, open clusters."""
-        con = _conn()
-        daily = _daily_pnl(con)
-        limit = PORTFOLIO_BALANCE * DRAWDOWN_LIMIT_PCT / 100.0
-        opens = _open_positions(con)
-        notional = round(sum(n for _, n in opens), 2)
+def check_circuit_breaker() -> Dict[str, Any]:
+    """
+    Checks if the daily drawdown exceeds 5%.
+    Uses the REAL portfolio balance.
+    """
+    try:
+        balance = _get_real_portfolio_balance()
+        db_path = os.path.join(os.path.dirname(__file__), "data", "trades.db")
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        
+        # Get today's P&L
+        cursor.execute("""
+            SELECT COALESCE(SUM(pnl), 0) 
+            FROM trades 
+            WHERE status='closed' AND date(closed_at) = date('now')
+        """)
+        daily_pnl = cursor.fetchone()[0] or 0.0
+        conn.close()
+        
+        daily_loss_pct = abs(daily_pnl) / balance if balance > 0 else 0
+        
+        if daily_loss_pct >= MAX_DAILY_DRAWDOWN:
+            return {
+                "status": "TRIPPED",
+                "reason": f"Daily drawdown of {daily_loss_pct*100:.2f}% exceeds {MAX_DAILY_DRAWDOWN*100}% limit.",
+                "daily_pnl": daily_pnl,
+                "portfolio_balance": balance
+            }
         return {
-            "daily_realized_pnl": round(daily, 2),
-            "drawdown_limit_usd": -limit,
-            "circuit_breaker": "TRIPPED" if daily <= -limit else "ARMED",
-            "open_notional": notional,
-            "max_open_notional": PORTFOLIO_BALANCE * MAX_EXPOSURE_PCT / 100.0,
-            "exposure_pct": round(notional / PORTFOLIO_BALANCE * 100.0, 2),
-            "open_symbols": sorted({_base(s) for s, _ in opens}),
+            "status": "ARMED",
+            "reason": f"Daily drawdown {daily_loss_pct*100:.2f}% is within limit.",
+            "daily_pnl": daily_pnl,
+            "portfolio_balance": balance
         }
+    except Exception as e:
+        return {"status": "ERROR", "reason": f"Cannot check circuit breaker: {e}"}
 
-    @mcp.tool()
-    def screen_proposal(symbol: str, proposed_notional: float) -> dict:
-        """Gate a new proposal against breaker, exposure cap and correlation cluster."""
-        con = _conn()
-        violations, warnings = [], []
-        daily = _daily_pnl(con)
-        limit = PORTFOLIO_BALANCE * DRAWDOWN_LIMIT_PCT / 100.0
-        if daily <= -limit:
-            violations.append(f"circuit breaker tripped (daily pnl {daily:.2f} <= {-limit:.2f})")
-        opens = _open_positions(con)
-        notional = sum(n for _, n in opens)
-        if notional + proposed_notional > PORTFOLIO_BALANCE * MAX_EXPOSURE_PCT / 100.0:
-            violations.append("exposure cap exceeded (>20% of portfolio would be open)")
-        base = _base(symbol)
-        clash = {_base(s) for s, _ in opens} & MAJORS
-        if base in MAJORS and clash:
-            warnings.append(f"correlated exposure: {sorted(clash)} already open (majors cluster)")
-        return {"approved": not violations, "violations": violations, "warnings": warnings}
-
-    @mcp.tool()
-    def atr_position_size(entry_price: float, atr: float,
-                          portfolio_balance: float = PORTFOLIO_BALANCE,
-                          risk_pct: float = 2.0) -> dict:
-        """Volatility-adjusted sizing: stop = 1.5x ATR, size = risk budget / stop distance."""
-        stop_distance = round(atr * ATR_STOP_MULT, 2)
-        risk_budget = portfolio_balance * risk_pct / 100.0
-        size = round(risk_budget / stop_distance, 6) if stop_distance > 0 else 0.0
+def check_exposure_limit(proposed_size: float, proposed_entry: float) -> Dict[str, Any]:
+    """
+    Ensures total open exposure does not exceed 20% of portfolio.
+    Uses REAL portfolio balance.
+    """
+    try:
+        balance = _get_real_portfolio_balance()
+        open_positions = _get_open_positions()
+        
+        # Calculate current exposure in USD
+        current_exposure = sum([p["size"] * p["entry"] for p in open_positions])
+        proposed_exposure = proposed_size * proposed_entry
+        total_exposure = current_exposure + proposed_exposure
+        
+        exposure_pct = total_exposure / balance if balance > 0 else 0
+        
+        if exposure_pct > MAX_OPEN_EXPOSURE:
+            return {
+                "status": "REJECTED",
+                "reason": f"Total exposure {exposure_pct*100:.2f}% exceeds {MAX_OPEN_EXPOSURE*100}% cap.",
+                "current_exposure_usd": round(current_exposure, 2),
+                "proposed_exposure_usd": round(proposed_exposure, 2),
+                "total_exposure_usd": round(total_exposure, 2),
+                "portfolio_balance": balance
+            }
         return {
-            "stop_distance": stop_distance,
-            "risk_budget_usd": risk_budget,
-            "position_size": size,
-            "notional": round(size * entry_price, 2),
-            "suggested_stop_buy": round(entry_price - stop_distance, 2),
-            "note": "wider volatility -> smaller size, inside the same 2% risk budget",
+            "status": "PASSED",
+            "reason": f"Total exposure {exposure_pct*100:.2f}% is within cap.",
+            "current_exposure_usd": round(current_exposure, 2),
+            "total_exposure_usd": round(total_exposure, 2),
+            "portfolio_balance": balance
         }
+    except Exception as e:
+        return {"status": "ERROR", "reason": f"Cannot check exposure: {e}"}
+
+def check_correlation_risk(proposed_symbol: str) -> Dict[str, Any]:
+    """
+    Warns if trying to open a correlated position (e.g., BTC and ETH).
+    """
+    if proposed_symbol not in CORE_ASSETS:
+        return {"status": "PASSED", "reason": "Asset not in core correlation set."}
+    
+    open_positions = _get_open_positions()
+    open_symbols = [p["symbol"] for p in open_positions]
+    
+    # If we already have BTC open and propose ETH, flag it.
+    for asset in CORE_ASSETS:
+        if asset != proposed_symbol and asset in open_symbols:
+            return {
+                "status": "WARNING",
+                "reason": f"Correlated asset {asset} is already open. Adding {proposed_symbol} increases correlated risk."
+            }
+    return {"status": "PASSED", "reason": "No correlation conflicts detected."}
