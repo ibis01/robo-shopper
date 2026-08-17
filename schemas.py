@@ -2,7 +2,7 @@
 Robo-Shopper V4 - Formal Governance Schemas (Sprint 5).
 Single source of truth for all data models.
 """
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime, timezone, timedelta, timezone
 from typing import Optional
 from enum import Enum
@@ -35,38 +35,34 @@ class ActorType(str, Enum):
 
 # --- The Core Trade Proposal (SINGLE DEFINITION) ---
 class TradeProposal(BaseModel):
-    # Metadata
+    """
+    Immutable proposal object — the canonical representation of a trade proposal.
+    Used for hash binding, approval tokens, and execution verification.
+    """
+    # Auto-generated fields
     id: Optional[int] = None
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    
+    # Core trade parameters
     asset: str
     side: TradeSide
+    entry_price: float
+    stop_loss: float
+    take_profit: Optional[float] = None
+    quantity: float
     
-    # Prices
-    entry_price: float = Field(gt=0)
-    stop_loss: float = Field(gt=0)
-    take_profit: Optional[float] = Field(None, gt=0)
+    # Risk parameters (computed at proposal time, immutable after)
+    risk_percent: float
+    risk_amount: float
+    portfolio_balance_at_time: float
     
-    # Sizing & Risk
-    quantity: float = Field(gt=0)
-    risk_amount: float = Field(gt=0)
-    risk_percent: float = Field(le=0.02)
-    portfolio_balance_at_time: float = Field(gt=0)
-    
-    # Governance
-    market_snapshot: dict = Field(default_factory=dict)
+    # Agent reasoning (LLM's justification, for human review)
     agent_reasoning: str
+    
+    # Risk engine decision (PASSED/REJECTED by deterministic rulebook)
     risk_decision: str
     
-    # Human approval
-    human_approval: Optional[bool] = None
-    approval_timestamp: Optional[datetime] = None
-    
-    # Execution
-    execution_status: TradeStatus = Field(default=TradeStatus.PROPOSED)
-    transaction_hash: Optional[str] = None
-    
-    # --- SECURITY: Proposal hash & policy binding ---
-    proposal_hash: Optional[str] = None
+    # Policy binding (version + chain + venue + wallet)
     policy_version: str = POLICY_VERSION
     chain_id: str = "x-layer"
     venue: str = "onchainos"
@@ -76,26 +72,32 @@ class TradeProposal(BaseModel):
     expires_at: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc) + timedelta(hours=PROPOSAL_EXPIRY_HOURS)
     )
-    
-    # --- Validators ---
-    @validator('stop_loss')
-    def validate_stop(cls, v, values):
-        if 'side' in values and 'entry_price' in values:
-            if values['side'] == TradeSide.LONG and v >= values['entry_price']:
-                raise ValueError("Stop loss must be BELOW entry for LONG")
-            if values['side'] == TradeSide.SHORT and v <= values['entry_price']:
-                raise ValueError("Stop loss must be ABOVE entry for SHORT")
-        return v
 
-    @validator('risk_percent')
-    def validate_risk(cls, v):
-        if v > 0.02:
-            raise ValueError(f"Risk {v*100}% exceeds 2% cap")
-        return v
+    @model_validator(mode='after')
+    def validate_cross_field(self) -> 'TradeProposal':
+        """Validate cross-field constraints using Pydantic V2 API."""
+        # Stop loss vs entry price based on side
+        if self.side.value == 'long':
+            if self.stop_loss >= self.entry_price:
+                raise ValueError(f"Long: stop_loss ({self.stop_loss}) must be < entry_price ({self.entry_price})")
+        elif self.side.value == 'short':
+            if self.stop_loss <= self.entry_price:
+                raise ValueError(f"Short: stop_loss ({self.stop_loss}) must be > entry_price ({self.entry_price})")
+        
+        # Risk percent bounds
+        if self.risk_percent is not None:
+            if not (0 <= self.risk_percent <= 1):
+                raise ValueError(f"risk_percent must be in [0, 1], got {self.risk_percent}")
+        
+        # Risk amount consistency check
+        if self.risk_amount is not None and self.risk_percent is not None:
+            if self.portfolio_balance_at_time and self.portfolio_balance_at_time > 0:
+                expected = self.risk_percent * self.portfolio_balance_at_time
+                if abs(self.risk_amount - expected) > 1.0:  # Allow small tolerance
+                    raise ValueError(f"risk_amount ({self.risk_amount}) != risk_percent * balance ({expected})")
+        
+        return self
     
-    # ------------------------------------------------------------------
-    # 🔑 Hash computation – correctly indented inside the class
-    # ------------------------------------------------------------------
     def compute_hash(self) -> str:
         """
         Deterministic SHA-256 hash binding ALL materially relevant parameters.
@@ -119,3 +121,5 @@ class TradeProposal(BaseModel):
             self.expires_at.isoformat()   # normalized UTC
         ])
         return hashlib.sha256(canonical.encode()).hexdigest()
+
+
