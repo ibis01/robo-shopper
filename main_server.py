@@ -35,22 +35,31 @@ server = Server("robo-shopper-universal")
 async def handle_list_tools() -> list[types.Tool]:
     return [
         # ---------- UNIFIED VETO GATE ----------
-        types.Tool(
-            name="screen_trade",
-            description="UNIFIED VETO GATE: Runs the trade through Risk Engine + Portfolio Guardrails + Circuit Breaker. Returns PASSED or REJECTED. This is the FINAL arbiter.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "symbol": {"type": "string", "enum": ["BTC", "ETH", "SOL"]},
-                    "side": {"type": "string", "enum": ["long", "short"]},
-                    "entry_price": {"type": "number"},
-                    "stop_loss": {"type": "number"},
-                    "quantity": {"type": "number"},
-                    "portfolio_balance": {"type": "number"}
-                },
-                "required": ["symbol", "side", "entry_price", "stop_loss", "quantity"]
-            }
-        ),
+        
+      types.Tool(
+         name="screen_trade",
+         description="UNIFIED VETO GATE: Runs an existing trade proposal (by ID) through Risk Engine + Portfolio Guardrails + Circuit Breaker. Updates the trade state to AWAITING_APPROVAL if PASSED, or REJECTED if failed. This is the FINAL arbiter.",
+         inputSchema={
+           "type": "object",
+           "properties": {
+            "trade_id": {"type": "integer", "description": "The ID of the trade proposal to screen."}
+        },
+        "required": ["trade_id"]
+    }
+),
+           types.Tool(
+    name="approve_and_execute",
+    description="Human action: Approves a trade and records its execution with the actual fill price.",
+    inputSchema={
+        "type": "object",
+        "properties": {
+            "trade_id": {"type": "integer"},
+            "execution_price": {"type": "number"},
+            "approved_by": {"type": "string", "default": "human"}
+        },
+        "required": ["trade_id", "execution_price"]
+    }
+),
         # ---------- MARKET INTELLIGENCE ----------
         types.Tool(
             name="analyze_technicals",
@@ -255,6 +264,17 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                             "message": "Trade passed ALL governance gates."
                         }
 
+elif name == "screen_trade":
+    from governance_engine import screen_trade
+    result = screen_trade(args.get("trade_id"))
+
+elif name == "approve_and_execute":
+    from governance_engine import approve_and_execute_trade
+    result = approve_and_execute_trade(
+        trade_id=args.get("trade_id"),
+        execution_price=args.get("execution_price"),
+        approved_by=args.get("approved_by", "human")
+    )
         # ---------- MARKET INTELLIGENCE ----------
         elif name == "analyze_technicals":
             result = market_intelligence_mcp.analyze_technicals(args.get("symbol"))
