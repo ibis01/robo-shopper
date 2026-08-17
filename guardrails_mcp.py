@@ -105,6 +105,17 @@ def check_exposure_limit(proposed_size: float, proposed_entry: float) -> Dict[st
     except Exception as e:
         return {"status": "ERROR", "reason": f"Cannot check exposure: {e}"}
 
+def check_circuit_breaker() -> Dict[str, Any]:
+    try:
+        balance = _get_real_portfolio_balance()
+        # ... check logic
+    except Exception as e:
+        return {
+            "status": "ERROR",
+            "reason": f"Circuit breaker unavailable: {e}",
+            "recommendation": "HARD STOP - no trades until resolved."
+        }
+        
 def check_correlation_risk(proposed_symbol: str) -> Dict[str, Any]:
     """
     Warns if trying to open a correlated position (e.g., BTC and ETH).

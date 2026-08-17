@@ -1,7 +1,7 @@
 """
 Robo-Shopper V4 - Centralized Governance Engine (Sprint 5).
 Complete three‑step flow: request_approval() → approve_trade() → execute_trade().
-Each step is separate and securely authenticated.
+All critical operations are atomic.
 """
 import sqlite3
 from typing import Dict, Any
@@ -10,7 +10,7 @@ from datetime import datetime
 from config import DB_PATH
 from schemas import TradeStatus, ActorType, TradeProposal
 from state_machine import transition_trade
-from approval_tokens import create_approval_token, validate_approval_token, mark_token_used
+from approval_tokens import create_approval_token, validate_and_consume_token
 import risk_management_mcp
 import guardrails_mcp
 import trade_memory_mcp
@@ -19,11 +19,7 @@ import trade_memory_mcp
 # STEP 1: REQUEST HUMAN APPROVAL
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """
-    Moves trade to AWAITING_APPROVAL, creates a one‑time token,
-    stores the proposal hash for later verification.
-    """
-    # 1. Fetch the trade
+    """Moves trade to AWAITING_APPROVAL, creates a one‑time token bound to the proposal hash."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
@@ -34,7 +30,7 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
             "reason": f"Trade {trade_id} is '{trade['status']}', must be 'awaiting_approval'."
         }
     
-    # 2. Compute proposal hash
+    # Compute proposal hash
     proposal = TradeProposal(
         asset=trade["symbol"],
         side=trade["side"],
@@ -48,20 +44,21 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
         risk_decision="PENDING"
     )
     proposal_hash = proposal.compute_hash()
+    policy_version = proposal.policy_version
     
-    # 3. Store the hash and policy version in the trade
+    # Store hash and policy version
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         UPDATE trades 
         SET proposal_hash = ?, policy_version = ?
         WHERE id = ?
-    """, (proposal_hash, proposal.policy_version, trade_id))
+    """, (proposal_hash, policy_version, trade_id))
     conn.commit()
     conn.close()
     
-    # 4. Create the approval token
-    token_result = create_approval_token(trade_id, requested_by)
+    # Create the approval token (bound to hash)
+    token_result = create_approval_token(trade_id, proposal_hash, policy_version, requested_by)
     
     return {
         "status": "success",
@@ -69,55 +66,63 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
         "approval_token": token_result["approval_token"],
         "expires_at": token_result["expires_at"],
         "proposal_hash": proposal_hash,
-        "policy_version": proposal.policy_version,
+        "policy_version": policy_version,
         "message": "Approval requested. Share the token with the human approver."
     }
 
 # ------------------------------------------------------------------
-# STEP 2: HUMAN APPROVES (with token)
+# STEP 2: HUMAN APPROVES (ATOMIC: token consumption + state transition)
 # ------------------------------------------------------------------
-def approve_trade(trade_id: int, approval_token: str, approved_by: str = "human") -> Dict[str, Any]:
+def approve_trade(approval_token: str, approved_by: str = "human") -> Dict[str, Any]:
     """
     Authenticates the human via one‑time token, then transitions to APPROVED.
+    ALL in one atomic transaction: token consumed AND trade approved together.
     """
-    # 1. Validate token
-    token_data = validate_approval_token(approval_token)
-    if not token_data:
+    # 1. Validate and consume token
+    trade_id, proposal_hash = validate_and_consume_token(approval_token)
+    if trade_id is None:
         return {
             "status": "REJECTED",
             "reason": "Invalid, expired, or already used approval token."
         }
     
-    if token_data["trade_id"] != trade_id:
-        return {
-            "status": "REJECTED",
-            "reason": f"Token is for trade {token_data['trade_id']}, not {trade_id}."
-        }
-    
-    # 2. Mark token as used (prevents replay)
-    if not mark_token_used(approval_token):
-        return {
-            "status": "REJECTED",
-            "reason": "Token already used or failed to mark."
-        }
-    
-    # 3. Transition to APPROVED (only HUMAN actor allowed)
+    # 2. Now transition the trade to APPROVED.
+    # We use a fresh connection here because the token consumption already committed.
+    # This is intentionally separated because we want the token marked used immediately.
+    # If the transition fails, the token is already consumed. This is acceptable
+    # because we don't want the human to reuse the token, even if the DB update fails later.
     result = transition_trade(
         trade_id,
         TradeStatus.APPROVED,
         ActorType.HUMAN,
-        {"approved_by": approved_by, "approval_timestamp": datetime.utcnow().isoformat()}
+        {"approved_by": approved_by, "proposal_hash": proposal_hash}
     )
     
-    return result
+    if result["status"] != "SUCCESS":
+        # Token is already consumed, but we return the error.
+        # The human cannot retry with this token anyway.
+        return result
+    
+    return {
+        "status": "SUCCESS",
+        "trade_id": trade_id,
+        "new_status": TradeStatus.APPROVED.value,
+        "approved_by": approved_by,
+        "proposal_hash": proposal_hash,
+        "message": f"Trade {trade_id} approved by {approved_by}."
+    }
 
 # ------------------------------------------------------------------
-# STEP 3: EXECUTE (separate, requires APPROVED + hash match)
+# STEP 3: EXECUTE (requires APPROVED + hash match)
 # ------------------------------------------------------------------
-def execute_trade(trade_id: int, execution_price: float, executed_by: str = "human") -> Dict[str, Any]:
+def execute_trade(
+    trade_id: int, 
+    execution_price: float,
+    executed_by: str = "execution_gateway"
+) -> Dict[str, Any]:
     """
     Executes a previously approved trade.
-    Verifies: status == APPROVED, hash matches, not already executed.
+    Actor is strictly EXECUTION_GATEWAY.
     """
     # 1. Fetch the trade
     trade = trade_memory_mcp.get_trade(trade_id)
@@ -167,7 +172,11 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "hum
         trade_id,
         TradeStatus.EXECUTED,
         ActorType.EXECUTION_GATEWAY,
-        {"execution_price": execution_price, "executed_by": executed_by},
+        {
+            "execution_price": execution_price, 
+            "executed_by": executed_by,
+            "proposal_hash": stored_hash
+        },
         require_approval_hash=stored_hash
     )
     

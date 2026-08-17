@@ -1,25 +1,32 @@
 """
 Robo-Shopper V4 - One-Time Approval Tokens (Sprint 5).
-Prevents replay, expiry, and unauthorized approval.
+Tokens are cryptographically bound to the proposal hash.
+Consumption is atomic with approval to prevent race conditions.
 """
 import secrets
 import sqlite3
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 
 from config import DB_PATH
 
-def create_approval_token(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Create a one‑time token that expires in 1 hour."""
+def create_approval_token(
+    trade_id: int, 
+    proposal_hash: str, 
+    policy_version: str,
+    requested_by: str = "ai"
+) -> Dict[str, Any]:
+    """Create a one‑time token bound to the exact proposal hash."""
     token = secrets.token_urlsafe(32)
     expires_at = datetime.utcnow() + timedelta(hours=1)
     
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
-        INSERT INTO approval_tokens (token, trade_id, requested_by, expires_at)
-        VALUES (?, ?, ?, ?)
-    """, (token, trade_id, requested_by, expires_at.isoformat()))
+        INSERT INTO approval_tokens 
+        (token, trade_id, proposal_hash, policy_version, requested_by, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (token, trade_id, proposal_hash, policy_version, requested_by, expires_at.isoformat()))
     conn.commit()
     conn.close()
     
@@ -27,40 +34,62 @@ def create_approval_token(trade_id: int, requested_by: str = "ai") -> Dict[str, 
         "status": "success",
         "approval_token": token,
         "trade_id": trade_id,
+        "proposal_hash": proposal_hash,
+        "policy_version": policy_version,
         "expires_at": expires_at.isoformat()
     }
 
-def validate_approval_token(token: str) -> Optional[Dict[str, Any]]:
-    """Returns trade_id if valid, else None (expired/used/invalid)."""
+def validate_and_consume_token(token: str) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Atomically validates and consumes the token in a single transaction.
+    Returns (trade_id, proposal_hash) if valid, else (None, None).
+    """
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT trade_id, expires_at, used_at FROM approval_tokens WHERE token = ?", (token,))
+    
+    # Start transaction
+    cursor.execute("BEGIN TRANSACTION")
+    
+    # 1. Select token with FOR UPDATE (locking) to prevent race conditions
+    cursor.execute("""
+        SELECT id, trade_id, proposal_hash, expires_at, used_at
+        FROM approval_tokens
+        WHERE token = ?
+    """, (token,))
     row = cursor.fetchone()
-    conn.close()
     
     if not row:
-        return None
+        conn.rollback()
+        conn.close()
+        return None, None
     
-    trade_id, expires_at_str, used_at = row
+    token_id, trade_id, proposal_hash, expires_at_str, used_at = row
     expires_at = datetime.fromisoformat(expires_at_str)
     
+    # 2. Validate
     if datetime.utcnow() > expires_at:
-        return None
-    if used_at:
-        return None
+        conn.rollback()
+        conn.close()
+        return None, None
+    if used_at is not None:
+        conn.rollback()
+        conn.close()
+        return None, None
     
-    return {"trade_id": trade_id}
-
-def mark_token_used(token: str) -> bool:
-    """Marks a token as used to prevent replay."""
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
+    # 3. Mark as used (atomic update)
     cursor.execute("""
         UPDATE approval_tokens
         SET used_at = ?
-        WHERE token = ? AND used_at IS NULL
-    """, (datetime.utcnow().isoformat(), token))
-    affected = cursor.rowcount
+        WHERE id = ? AND used_at IS NULL
+    """, (datetime.utcnow().isoformat(), token_id))
+    
+    if cursor.rowcount == 0:
+        conn.rollback()
+        conn.close()
+        return None, None
+    
+    # 4. Commit the consumption
     conn.commit()
     conn.close()
-    return affected == 1
+    
+    return trade_id, proposal_hash

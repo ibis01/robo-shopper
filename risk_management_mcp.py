@@ -21,6 +21,16 @@ except ImportError:
 # Ensure the data directory exists
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
+def _get_real_portfolio_balance() -> float:
+    try:
+        # ... attempt to fetch balance
+        if balance is None:
+            raise ValueError("Balance not available")
+        return balance
+    except Exception as e:
+        # HARD STOP - NEVER use default
+        raise RuntimeError(f"HARD STOP: Cannot retrieve portfolio balance: {e}")
+        
 # ------------------------------------------------------------------
 # 1. PORTFOLIO BALANCE (HARD STOP ON FAILURE)
 # ------------------------------------------------------------------
