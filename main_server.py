@@ -18,6 +18,7 @@ import trade_memory_mcp
 import risk_management_mcp
 import onchain_execution_mcp
 import proactive_alerts_mcp
+import guardrails_mcp  # <-- ADDED for screen_trade
 
 # --- V4 New MCPs ---
 import options_mcp
@@ -33,6 +34,23 @@ server = Server("robo-shopper-universal")
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
     return [
+        # ---------- UNIFIED VETO GATE ----------
+        types.Tool(
+            name="screen_trade",
+            description="UNIFIED VETO GATE: Runs the trade through Risk Engine + Portfolio Guardrails + Circuit Breaker. Returns PASSED or REJECTED. This is the FINAL arbiter.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "symbol": {"type": "string", "enum": ["BTC", "ETH", "SOL"]},
+                    "side": {"type": "string", "enum": ["long", "short"]},
+                    "entry_price": {"type": "number"},
+                    "stop_loss": {"type": "number"},
+                    "quantity": {"type": "number"},
+                    "portfolio_balance": {"type": "number"}
+                },
+                "required": ["symbol", "side", "entry_price", "stop_loss", "quantity"]
+            }
+        ),
         # ---------- MARKET INTELLIGENCE ----------
         types.Tool(
             name="analyze_technicals",
@@ -202,8 +220,43 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
     result = None
     
     try:
+        # ---------- UNIFIED SCREEN ----------
+        if name == "screen_trade":
+            # Step 1: Core risk check
+            risk_result = risk_management_mcp.evaluate_trade_risk(
+                symbol=args.get("symbol"),
+                side=args.get("side"),
+                entry=args.get("entry_price"),
+                stop=args.get("stop_loss"),
+                size=args.get("quantity"),
+                portfolio_balance=args.get("portfolio_balance")
+            )
+            if risk_result["status"] == "REJECTED":
+                result = risk_result
+            else:
+                # Step 2: Portfolio guardrails
+                exposure = guardrails_mcp.check_exposure_limit(
+                    args.get("quantity"), 
+                    args.get("entry_price")
+                )
+                if exposure["status"] == "REJECTED":
+                    result = exposure
+                else:
+                    breaker = guardrails_mcp.check_circuit_breaker()
+                    if breaker["status"] == "TRIPPED":
+                        result = breaker
+                    else:
+                        # All passed
+                        result = {
+                            "status": "PASSED",
+                            "risk_check": risk_result,
+                            "exposure_check": exposure,
+                            "circuit_breaker": breaker,
+                            "message": "Trade passed ALL governance gates."
+                        }
+
         # ---------- MARKET INTELLIGENCE ----------
-        if name == "analyze_technicals":
+        elif name == "analyze_technicals":
             result = market_intelligence_mcp.analyze_technicals(args.get("symbol"))
             
         elif name == "get_derivatives_context":
@@ -211,7 +264,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         
         # ---------- RISK & GOVERNANCE ----------
         elif name == "calculate_position_size":
-            # This now raises Hard Stop errors on invalid inputs or missing balance
             result = risk_management_mcp.calculate_position_size(
                 entry=args.get("entry"),
                 stop=args.get("stop"),
@@ -219,7 +271,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             )
             
         elif name == "evaluate_trade_risk":
-            # Explicitly import the hardened risk evaluator
             result = risk_management_mcp.evaluate_trade_risk(
                 symbol=args.get("symbol"),
                 side=args.get("side"),
@@ -237,9 +288,9 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             result = trade_memory_mcp.propose_trade(
                 symbol=args.get("symbol"),
                 side=args.get("side"),
-                size=args.get("size"),
-                entry=args.get("entry"),
-                stop=args.get("stop"),
+                quantity=args.get("size"),   # map 'size' to 'quantity'
+                entry_price=args.get("entry"),
+                stop_loss=args.get("stop"),
                 take_profit=args.get("take_profit"),
                 reasoning=args.get("reasoning", "Proposed by LLM")
             )

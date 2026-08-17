@@ -11,9 +11,15 @@ import os
 import sqlite3
 from typing import Optional, Dict, Any
 
-# Database path – assumes data/ folder exists in project root
+# Database path – uses unified config if available, otherwise falls back
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "data", "trades.db")
+try:
+    from config import DB_PATH
+except ImportError:
+    DB_PATH = os.path.join(BASE_DIR, "data", "trades.db")
+
+# Ensure the data directory exists
+os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
 # ------------------------------------------------------------------
 # 1. PORTFOLIO BALANCE (HARD STOP ON FAILURE)
@@ -24,9 +30,6 @@ def _get_real_portfolio_balance() -> float:
     If the balance cannot be retrieved, it raises a Hard Stop error.
     NEVER silently falls back to $10,000.
     """
-    # Ensure the data directory exists
-    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-    
     try:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
@@ -158,7 +161,7 @@ def evaluate_trade_risk(
         rsi_override: For testing, bypass RSI fetch
     
     Returns:
-        Dict with status ("PASSED" or "REJECTED") and a reason.
+        Dict with status ("PASSED" or "REJECTED"), reason, and warnings.
     
     Raises:
         ValueError: If inputs are invalid.
@@ -196,56 +199,52 @@ def evaluate_trade_risk(
                       f"Risk amount: ${risk_usd:.2f} on portfolio of ${portfolio_balance:.2f}.",
             "risk_percent": round(risk_percent, 2),
             "risk_usd": round(risk_usd, 2),
-            "portfolio_balance": round(portfolio_balance, 2)
+            "portfolio_balance": round(portfolio_balance, 2),
+            "warnings": []
         }
-    
-    # --- Check 2: RSI / Overbought Oversold (Optional, but recommended) ---
-    # We attempt to fetch RSI from market_intelligence_mcp if available.
-    # If not available, we skip this check (but log a warning).
+
+    # --- Check 2: RSI / Overbought Oversold (WITH WARNINGS, NOT SILENT) ---
+    warnings = []
+    rsi = None
     try:
         import market_intelligence_mcp
         if rsi_override is not None:
             rsi = rsi_override
         else:
-            # We only check RSI for spot/perps; options/prediction markets might not have RSI.
             tech_data = market_intelligence_mcp.analyze_technicals(symbol)
             if isinstance(tech_data, dict) and "rsi" in tech_data:
                 rsi = tech_data["rsi"]
-            else:
-                rsi = None
         
         if rsi is not None:
-            # If RSI > 70 and side is "long" -> reject (overbought)
             if rsi > 70 and side == "long":
                 return {
                     "status": "REJECTED",
                     "reason": f"RSI is {rsi:.1f} (overbought > 70). Long trade rejected.",
+                    "warnings": warnings,
                     "rsi": round(rsi, 1),
                     "portfolio_balance": round(portfolio_balance, 2)
                 }
-            # If RSI < 30 and side is "short" -> reject (oversold)
             if rsi < 30 and side == "short":
                 return {
                     "status": "REJECTED",
                     "reason": f"RSI is {rsi:.1f} (oversold < 30). Short trade rejected.",
+                    "warnings": warnings,
                     "rsi": round(rsi, 1),
                     "portfolio_balance": round(portfolio_balance, 2)
                 }
     except ImportError:
-        # market_intelligence_mcp not available, skip RSI check
-        pass
-    except Exception:
-        # Any error fetching RSI, skip gracefully
-        pass
+        warnings.append("market_intelligence_mcp not available – RSI check skipped.")
+    except Exception as e:
+        warnings.append(f"RSI check failed: {str(e)} – proceeding with core risk checks.")
     
     # --- Check 3: Minimum position sanity ---
-    # For BTC, minimum is usually 0.0001. For ETH, 0.001. For SOL, 0.01.
     min_size_map = {"BTC": 0.0001, "ETH": 0.001, "SOL": 0.01}
     min_size = min_size_map.get(symbol, 0.0001)
     if size < min_size:
         return {
             "status": "REJECTED",
             "reason": f"Position size {size:.8f} is below minimum {min_size:.8f} for {symbol}.",
+            "warnings": warnings,
             "portfolio_balance": round(portfolio_balance, 2)
         }
     
@@ -253,6 +252,7 @@ def evaluate_trade_risk(
     return {
         "status": "PASSED",
         "reason": f"Trade passed all risk checks. Risk: {risk_percent:.2f}% (within 2% cap).",
+        "warnings": warnings,
         "risk_percent": round(risk_percent, 2),
         "risk_usd": round(risk_usd, 2),
         "portfolio_balance": round(portfolio_balance, 2)
@@ -296,21 +296,20 @@ if __name__ == "__main__":
     
     # Test 1: Calculate position size
     try:
-        result = calculate_position_size(entry=60000, stop=59500)
+        result = calculate_position_size(entry=60000, stop=59500, portfolio_balance=10000)
         print(f"✅ calculate_position_size: {result}")
     except Exception as e:
         print(f"❌ calculate_position_size error: {e}")
     
     # Test 2: Evaluate trade risk (should PASS)
     try:
-        # Mock balance override for testing
         result = evaluate_trade_risk(
             symbol="BTC",
             side="long",
             entry=60000,
             stop=59500,
             size=0.4,
-            portfolio_balance=10000.0  # Override for test
+            portfolio_balance=10000.0
         )
         print(f"✅ evaluate_trade_risk (PASS expected): {result}")
     except Exception as e:
@@ -322,7 +321,7 @@ if __name__ == "__main__":
             symbol="BTC",
             side="long",
             entry=60000,
-            stop=59000,  # Wider stop -> higher risk
+            stop=59000,
             size=0.4,
             portfolio_balance=10000.0
         )

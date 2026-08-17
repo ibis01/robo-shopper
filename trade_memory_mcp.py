@@ -1,186 +1,158 @@
-import os
+#!/usr/bin/env python3
+"""
+Robo-Shopper V4 - Trade Memory MCP (Sprint 5).
+Manages the SQLite ledger with strict state enforcement.
+"""
 import sqlite3
-import logging
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+import json
+from datetime import datetime
+from typing import Optional, Dict, Any, List
 
-logger = logging.getLogger("robo_shopper.trade_memory")
-logging.basicConfig(level=logging.INFO)
+from config import DB_PATH
+from schemas import TradeStatus, TradeProposal
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trades.db")
-
-def get_db():
+# ------------------------------------------------------------------
+# 1. PROPOSE A TRADE
+# ------------------------------------------------------------------
+def propose_trade(
+    symbol: str,
+    side: str,
+    quantity: float,
+    entry_price: float,
+    stop_loss: float,
+    take_profit: Optional[float] = None,
+    reasoning: Optional[str] = None,
+    portfolio_balance: Optional[float] = None
+) -> Dict[str, Any]:
+    """
+    Logs a new trade proposal with status = PROPOSED.
+    """
+    if not symbol or not side or quantity <= 0 or entry_price <= 0 or stop_loss <= 0:
+        raise ValueError("Invalid trade parameters. All values must be positive.")
+    
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-def init_db():
-    conn = get_db()
-    conn.execute('''
+    cursor = conn.cursor()
+    
+    # Create table if not exists
+    cursor.execute("""
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT NOT NULL,
-            proposed_amount REAL,
-            proposed_price REAL,
-            actual_entry_price REAL,
-            exit_price REAL,
-            status TEXT DEFAULT 'proposed',
-            user_feedback TEXT,
-            proposed_at TEXT NOT NULL,
-            executed_at TEXT,
-            closed_at TEXT,
+            symbol TEXT,
+            side TEXT,
+            quantity REAL,
+            entry_price REAL,
+            stop_loss REAL,
+            take_profit REAL,
+            reasoning TEXT,
+            portfolio_balance REAL,
+            status TEXT,
+            created_at TIMESTAMP,
+            risk_checked_at TIMESTAMP,
+            approved_at TIMESTAMP,
+            executed_at TIMESTAMP,
+            closed_at TIMESTAMP,
             pnl REAL,
-            hold_time_seconds REAL
+            feedback TEXT
         )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-def _propose_trade(symbol: str, side: str, amount: float, proposed_price: float) -> Dict[str, Any]:
-    conn = get_db()
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "INSERT INTO trades (symbol, side, proposed_amount, proposed_price, proposed_at) VALUES (?, ?, ?, ?, ?)",
-        (symbol.upper(), side.lower(), amount, proposed_price, now)
-    )
+    """)
+    
+    # Insert the proposal
+    cursor.execute("""
+        INSERT INTO trades (
+            symbol, side, quantity, entry_price, stop_loss, take_profit, 
+            reasoning, portfolio_balance, status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        symbol, side, quantity, entry_price, stop_loss, take_profit,
+        reasoning, portfolio_balance, TradeStatus.PROPOSED.value, datetime.utcnow().isoformat()
+    ))
+    
     trade_id = cursor.lastrowid
     conn.commit()
     conn.close()
+    
     return {
-        "ok": True, 
-        "tool": "propose_trade", 
-        "trade_id": trade_id, 
-        "status": "proposed", 
-        "message": "Trade logged. Awaiting human approval and execution."
+        "status": "success",
+        "trade_id": trade_id,
+        "message": f"Trade {trade_id} proposed for {symbol} {side}.",
+        "current_status": TradeStatus.PROPOSED.value
     }
 
-def _record_execution(trade_id: int, actual_entry_price: float, user_feedback: str) -> Dict[str, Any]:
-    conn = get_db()
-    now = datetime.now(timezone.utc).isoformat()
-    cursor = conn.execute(
-        "UPDATE trades SET actual_entry_price = ?, user_feedback = ?, executed_at = ?, status = 'executed' WHERE id = ?",
-        (actual_entry_price, user_feedback, now, trade_id)
-    )
-    conn.commit()
-    updated = cursor.rowcount
-    conn.close()
+# ------------------------------------------------------------------
+# 2. RECORD EXECUTION (WITH HARD STATE ENFORCEMENT)
+# ------------------------------------------------------------------
+def record_execution(trade_id: int, execution_price: float, feedback: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Records the execution of a trade.
+    🔒 HARD STOP: Trade MUST be in APPROVED status. Cannot execute otherwise.
+    """
+    if not trade_id or trade_id <= 0:
+        raise ValueError("Invalid trade_id.")
+    if execution_price <= 0:
+        raise ValueError("Execution price must be positive.")
     
-    if updated == 0:
-        return {"ok": False, "tool": "record_execution", "error": f"Trade ID {trade_id} not found."}
-        
-    return {
-        "ok": True, 
-        "tool": "record_execution", 
-        "trade_id": trade_id, 
-        "status": "executed", 
-        "message": "Execution, entry price, and feedback recorded."
-    }
-
-def _close_trade(trade_id: int, exit_price: float) -> Dict[str, Any]:
-    conn = get_db()
-    now = datetime.now(timezone.utc).isoformat()
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+    # 1. Fetch the current trade
+    cursor.execute("SELECT status, entry_price, stop_loss, quantity FROM trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
     if not row:
         conn.close()
-        return {"ok": False, "tool": "close_trade", "error": f"Trade ID {trade_id} not found."}
-        
-    if row["status"] != "executed":
+        raise ValueError(f"Trade ID {trade_id} not found.")
+    
+    current_status, entry, stop, qty = row
+    
+    # 2. 🔥 ENFORCE STATE MACHINE: Only APPROVED can be executed
+    if current_status != TradeStatus.APPROVED.value:
         conn.close()
-        return {"ok": False, "tool": "close_trade", "error": f"Trade {trade_id} must be executed before closing."}
-        
-    entry = row["actual_entry_price"]
-    side = row["side"]
-    amount = row["proposed_amount"] or 1.0
+        raise ValueError(
+            f"ILLEGAL STATE TRANSITION: Trade {trade_id} is '{current_status}', "
+            f"but must be '{TradeStatus.APPROVED.value}' to execute."
+        )
     
-    if side == "buy":
-        pnl = (exit_price - entry) * amount
-    else:
-        pnl = (entry - exit_price) * amount
-        
-    executed_at = datetime.fromisoformat(row["executed_at"])
-    closed_at = datetime.fromisoformat(now)
-    hold_time = (closed_at - executed_at).total_seconds()
+    # 3. Update to EXECUTED
+    cursor.execute("""
+        UPDATE trades 
+        SET status = ?, executed_at = ?, feedback = ?
+        WHERE id = ?
+    """, (TradeStatus.EXECUTED.value, datetime.utcnow().isoformat(), feedback, trade_id))
     
-    conn.execute(
-        "UPDATE trades SET exit_price = ?, closed_at = ?, status = 'closed', pnl = ?, hold_time_seconds = ? WHERE id = ?",
-        (exit_price, now, pnl, hold_time, trade_id)
-    )
     conn.commit()
     conn.close()
     
     return {
-        "ok": True, 
-        "tool": "close_trade", 
-        "trade_id": trade_id, 
-        "status": "closed", 
-        "pnl": round(pnl, 4),
-        "hold_time_seconds": round(hold_time, 2)
+        "status": "success",
+        "trade_id": trade_id,
+        "message": f"Trade {trade_id} executed at ${execution_price:.2f}.",
+        "new_status": TradeStatus.EXECUTED.value
     }
 
-def _get_trade_history(symbol: Optional[str] = None, limit: int = 10) -> Dict[str, Any]:
-    conn = get_db()
+# ------------------------------------------------------------------
+# 3. APPROVE A TRADE (State: AWAITING_APPROVAL → APPROVED)
+# ------------------------------------------------------------------
+def approve_trade(trade_id: int) -> Dict[str, Any]:
+    """Moves a trade from AWAITING_APPROVAL to APPROVED."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
     
-    total = conn.execute("SELECT COUNT(*) FROM trades").fetchone()[0]
-    executed = conn.execute("SELECT COUNT(*) FROM trades WHERE status IN ('executed', 'closed')").fetchone()[0]
-    wins = conn.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl > 0").fetchone()[0]
-    losses = conn.execute("SELECT COUNT(*) FROM trades WHERE status='closed' AND pnl <= 0").fetchone()[0]
-    avg_hold = conn.execute("SELECT AVG(hold_time_seconds) FROM trades WHERE status='closed' AND hold_time_seconds IS NOT NULL").fetchone()[0]
+    cursor.execute("SELECT status FROM trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
+    if not row:
+        conn.close()
+        raise ValueError(f"Trade {trade_id} not found.")
     
-    metrics = {
-        "total_proposals": total,
-        "executed_trades": executed,
-        "wins": wins,
-        "losses": losses,
-        "win_loss_ratio": round(wins / losses, 2) if losses > 0 else float(wins),
-        "average_hold_time_seconds": round(avg_hold, 2) if avg_hold else 0,
-        "human_approval_rate": round(executed / total, 2) if total > 0 else 0
-    }
+    if row[0] != TradeStatus.AWAITING_APPROVAL.value:
+        conn.close()
+        raise ValueError(f"Trade {trade_id} is '{row[0]}', must be '{TradeStatus.AWAITING_APPROVAL.value}' to approve.")
     
-    query = "SELECT * FROM trades"
-    params = []
-    if symbol:
-        query += " WHERE symbol = ?"
-        params.append(symbol.upper())
-    query += " ORDER BY proposed_at DESC LIMIT ?"
-    params.append(limit)
+    cursor.execute("""
+        UPDATE trades 
+        SET status = ?, approved_at = ?
+        WHERE id = ?
+    """, (TradeStatus.APPROVED.value, datetime.utcnow().isoformat(), trade_id))
     
-    rows = conn.execute(query, params).fetchall()
+    conn.commit()
     conn.close()
     
-    recent_trades = [dict(row) for row in rows]
-    
-    return {
-        "ok": True,
-        "tool": "get_trade_history",
-        "metrics": metrics,
-        "recent_trades": recent_trades
-    }
-
-def register_trade_memory_tools(mcp: Any) -> None:
-    @mcp.tool()
-    def propose_trade(symbol: str, side: str, amount: float, proposed_price: float) -> Dict[str, Any]:
-        """Log a proposed trade to the database before human approval."""
-        return _propose_trade(symbol, side, amount, proposed_price)
-
-    @mcp.tool()
-    def record_execution(trade_id: int, actual_entry_price: float, user_feedback: str) -> Dict[str, Any]:
-        """Record that the human approved and the trade was executed."""
-        return _record_execution(trade_id, actual_entry_price, user_feedback)
-
-    @mcp.tool()
-    def close_trade(trade_id: int, exit_price: float) -> Dict[str, Any]:
-        """Close an executed trade and calculate PnL and hold time."""
-        return _close_trade(trade_id, exit_price)
-
-    @mcp.tool()
-    def get_trade_history(symbol: Optional[str] = None, limit: int = 10) -> Dict[str, Any]:
-        """Get past trade history, win/loss ratio, average hold time, and human approval rate."""
-        return _get_trade_history(symbol, limit)
-
-if __name__ == "__main__":
-    import json
-    print(json.dumps(_get_trade_history(), indent=2))
+    return {"status": "success", "trade_id": trade_id, "new_status": TradeStatus.APPROVED.value}
