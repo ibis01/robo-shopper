@@ -1,23 +1,24 @@
 """
 Robo-Shopper V4 - Concurrency Tests (Sprint 5).
-Proves that atomic transactions prevent race conditions.
+Proves atomic transactions prevent race conditions.
 """
 import pytest
 import sys
 import os
+import sqlite3
 import threading
 import time
-import sqlite3
+from datetime import datetime, timedelta, timezone
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from governance_engine import request_approval, approve_trade, screen_trade
-from trade_memory_mcp import propose_trade
+from schemas import TradeStatus, ActorType
+from state_machine import transition_trade
+from governance_engine import request_approval, approve_trade, execute_trade
+from trade_memory_mcp import propose_trade, get_trade
 from config import DB_PATH
 
-# ------------------------------------------------------------------
-# FIXTURE: Clean DB
-# ------------------------------------------------------------------
+
 @pytest.fixture
 def clean_db():
     conn = sqlite3.connect(DB_PATH)
@@ -34,88 +35,60 @@ def clean_db():
     conn.commit()
     conn.close()
 
-# ------------------------------------------------------------------
-# TEST: CONCURRENT APPROVALS
-# ------------------------------------------------------------------
+
+def create_proposed_trade(symbol="BTC", side="long", quantity=0.4, entry=60000, stop=59500):
+    prop = propose_trade(symbol, side, quantity, entry, stop, reasoning="concurrent")
+    return prop["trade_id"]
+
+
 def test_concurrent_approvals(clean_db):
-    """10 simultaneous approvals on the SAME trade. Exactly 1 should succeed."""
-    # 1. Create a trade and move it to AWAITING_APPROVAL
-    prop = propose_trade("BTC", "long", 0.4, 60000, 59500, reasoning="concurrent")
-    tid = prop["trade_id"]
-    screen_trade(tid)  # Moves to AWAITING_APPROVAL
-    
-    # 2. Generate 10 unique tokens for the SAME trade
+    tid = create_proposed_trade()
     tokens = []
     for _ in range(10):
         req = request_approval(tid)
+        assert req["status"] == "success"
         tokens.append(req["approval_token"])
     
-    # 3. Fire off 10 threads simultaneously
     results = []
     def approve_thread(token):
-        time.sleep(0.01)  # Small delay to increase chance of overlap
-        result = approve_trade(token)
-        results.append(result)
+        time.sleep(0.01)
+        results.append(approve_trade(token))
     
     threads = []
     for token in tokens:
         t = threading.Thread(target=approve_thread, args=(token,))
         threads.append(t)
         t.start()
-    
     for t in threads:
         t.join()
     
-    # 4. Exactly ONE approval should succeed
     successes = [r for r in results if r["status"] == "SUCCESS"]
-    assert len(successes) == 1, f"Expected exactly 1 success, got {len(successes)}. Results: {results}"
-    
-    # 5. Verify the trade is approved
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT status FROM trades WHERE id = ?", (tid,))
-    status = cursor.fetchone()[0]
-    conn.close()
-    assert status == "approved"
+    assert len(successes) == 1
+    trade = get_trade(tid)
+    assert trade["status"] == TradeStatus.APPROVED.value
+
 
 def test_concurrent_executions(clean_db):
-    """10 simultaneous executions on the SAME approved trade. Exactly 1 should succeed."""
-    # 1. Create and approve a trade
-    prop = propose_trade("BTC", "long", 0.4, 60000, 59500, reasoning="concurrent_exec")
-    tid = prop["trade_id"]
-    screen_trade(tid)
+    tid = create_proposed_trade()
     req = request_approval(tid)
+    assert req["status"] == "success"
     token = req["approval_token"]
-    approve_trade(token)  # Now APPROVED
+    approve_trade(token)
     
-    # 2. Fire off 10 execution threads
     results = []
     def execute_thread(idx):
         time.sleep(0.01)
-        from governance_engine import execute_trade
-        # Use different execution prices, doesn't matter
-        result = execute_trade(tid, execution_price=60000 + idx)
-        results.append(result)
+        results.append(execute_trade(tid, execution_price=60000 + idx))
     
     threads = []
     for i in range(10):
         t = threading.Thread(target=execute_thread, args=(i,))
         threads.append(t)
         t.start()
-    
     for t in threads:
         t.join()
     
-    # 3. Exactly ONE execution should succeed with non-idempotent status
-    # The others should return SUCCESS but with idempotent=True
     non_idempotent = [r for r in results if r["status"] == "SUCCESS" and not r.get("idempotent", False)]
-    # At least one should succeed. The rest will be idempotent.
-    assert len(non_idempotent) >= 1, f"Expected at least 1 non-idempotent success, got {len(non_idempotent)}"
-    
-    # Verify the trade is executed
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("SELECT status FROM trades WHERE id = ?", (tid,))
-    status = cursor.fetchone()[0]
-    conn.close()
-    assert status == "executed"
+    assert len(non_idempotent) >= 1
+    trade = get_trade(tid)
+    assert trade["status"] == TradeStatus.EXECUTED.value
