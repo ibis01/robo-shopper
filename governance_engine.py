@@ -119,7 +119,8 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, status, proposal_hash, policy_version, entry_price, quantity, stop_loss,
-                   risk_percent, risk_amount, portfolio_balance, proposal_expires_at, reasoning
+                   risk_percent, risk_amount, portfolio_balance, proposal_expires_at, reasoning,
+                   symbol, side, take_profit
             FROM trades WHERE id = ?
         """, (trade_id,))
         row = cursor.fetchone()
@@ -129,7 +130,8 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
             return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
         
         (_, trade_status, trade_hash, trade_policy, entry, qty, stop,
-         risk_pct, risk_amt, balance, expires_at_str, reasoning) = row
+         risk_pct, risk_amt, balance, expires_at_str, reasoning,
+         symbol, side, take_profit) = row
         
         if trade_status != TradeStatus.AWAITING_APPROVAL.value:
             conn.rollback()
@@ -138,16 +140,18 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         
         # Defense-in-depth: recompute proposal hash and verify three-way match
         # TOKEN HASH == TRADE HASH == COMPUTED HASH
+        # For hash verification, use defensive defaults if values are None
+        # (actual execution will fail-closed, but hash verification needs complete data)
         proposal = TradeProposal(
-            asset=trade["symbol"] if "symbol" in trade else "BTC",
-            side=trade["side"] if "side" in trade else "long",
+            asset=symbol or "BTC",
+            side=side or "long",
             entry_price=entry,
             stop_loss=stop,
-            take_profit=trade.get("take_profit"),
+            take_profit=take_profit,
             quantity=qty,
-            risk_percent=risk_pct,
-            risk_amount=risk_amt,
-            portfolio_balance_at_time=balance,
+            risk_percent=risk_pct or 0.02,
+            risk_amount=risk_amt or (abs(entry - stop) * qty),
+            portfolio_balance_at_time=balance or 10000.0,
             agent_reasoning=reasoning or "",
             risk_decision="PASSED",
             expires_at=datetime.fromisoformat(expires_at_str) if expires_at_str else datetime.now(timezone.utc) + timedelta(hours=24)

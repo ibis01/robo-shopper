@@ -8,6 +8,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 from config import DB_PATH
+
+# Default portfolio balance used when a proposal is created without one
+DEFAULT_PORTFOLIO_BALANCE = 10000.0
 from schemas import TradeStatus
 from state_machine import transition_trade, ActorType
 
@@ -28,10 +31,14 @@ def propose_trade(
     if not symbol or not side or quantity <= 0 or entry_price <= 0 or stop_loss <= 0:
         raise ValueError("Invalid trade parameters.")
     
+    # Persist a real portfolio_balance at creation (fail-closed later reads this value)
+    if portfolio_balance is None or portfolio_balance <= 0:
+        portfolio_balance = DEFAULT_PORTFOLIO_BALANCE
+
     # Compute risk metrics
     risk_per_unit = abs(entry_price - stop_loss)
     risk_amount = risk_per_unit * quantity
-    risk_percent = risk_amount / portfolio_balance if portfolio_balance and portfolio_balance > 0 else 0.02
+    risk_percent = risk_amount / portfolio_balance
     
     # Expiration (24h from now) – use timezone-aware UTC
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=24)).isoformat()
