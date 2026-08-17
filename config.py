@@ -19,3 +19,27 @@ MAX_RISK_PER_TRADE = 0.02      # 2%
 MAX_DAILY_DRAWDOWN = 0.05      # 5%
 MAX_OPEN_EXPOSURE = 0.20       # 20%
 CORE_ASSETS = ["BTC", "ETH", "SOL"]
+
+def ensure_schema():
+    """Ensures all columns for the state machine exist."""
+    import sqlite3
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute("PRAGMA table_info(trades)")
+    existing = [row[1] for row in cursor.fetchall()]
+    
+    new_cols = {
+        "proposal_hash": "TEXT",
+        "last_modified_by": "TEXT",
+        "transition_metadata": "TEXT",
+        "approval_requested_at": "TIMESTAMP",
+        "last_modified_at": "TIMESTAMP",
+    }
+    
+    for col, col_type in new_cols.items():
+        if col not in existing:
+            cursor.execute(f"ALTER TABLE trades ADD COLUMN {col} {col_type}")
+    
+    conn.commit()
+    conn.close()

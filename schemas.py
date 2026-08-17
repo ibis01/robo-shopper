@@ -21,6 +21,16 @@ class TradeStatus(str, Enum):
 class TradeSide(str, Enum):
     LONG = "long"
     SHORT = "short"
+    
+class TradeProposal(BaseModel):
+    # ... existing fields
+    proposal_hash: Optional[str] = Field(None, description="SHA256 hash of canonical trade for approval binding")
+    
+    def compute_hash(self) -> str:
+        """Computes a deterministic hash of the trade proposal."""
+        import hashlib
+        canonical = f"{self.asset}|{self.side}|{self.entry_price}|{self.stop_loss}|{self.take_profit}|{self.quantity}"
+        return hashlib.sha256(canonical.encode()).hexdigest()
 
 # --- The Core Trade Proposal Object ---
 class TradeProposal(BaseModel):
