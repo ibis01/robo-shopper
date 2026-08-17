@@ -1,7 +1,6 @@
 """
 Robo-Shopper V4 - Centralized Governance Engine (Sprint 5).
-Complete three‑step flow: request_approval() → approve_trade() → execute_trade().
-All critical operations are atomic.
+Atomic approval: token consumption + hash verification + state transition in ONE transaction.
 """
 import sqlite3
 from typing import Dict, Any
@@ -10,7 +9,7 @@ from datetime import datetime
 from config import DB_PATH
 from schemas import TradeStatus, ActorType, TradeProposal
 from state_machine import transition_trade
-from approval_tokens import create_approval_token, validate_and_consume_token
+from approval_tokens import create_approval_token, validate_and_consume_token_in_transaction
 import risk_management_mcp
 import guardrails_mcp
 import trade_memory_mcp
@@ -71,46 +70,110 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
     }
 
 # ------------------------------------------------------------------
-# STEP 2: HUMAN APPROVES (ATOMIC: token consumption + state transition)
+# STEP 2: HUMAN APPROVES (ATOMIC: token + hash verification + transition)
 # ------------------------------------------------------------------
 def approve_trade(approval_token: str, approved_by: str = "human") -> Dict[str, Any]:
     """
-    Authenticates the human via one‑time token, then transitions to APPROVED.
-    ALL in one atomic transaction: token consumed AND trade approved together.
+    Authenticates the human via one‑time token, verifies the hash matches the trade,
+    and transitions to APPROVED – ALL in ONE atomic transaction.
+    
+    The `approved_by` is set by the system (e.g., from authenticated session).
     """
-    # 1. Validate and consume token
-    trade_id, proposal_hash = validate_and_consume_token(approval_token)
-    if trade_id is None:
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("BEGIN EXCLUSIVE")  # Lock the database for this critical block
+    
+    try:
+        # 1. Validate and consume token
+        trade_id, token_hash, token_policy = validate_and_consume_token_in_transaction(conn, approval_token)
+        if trade_id is None:
+            conn.rollback()
+            conn.close()
+            return {
+                "status": "REJECTED",
+                "reason": "Invalid, expired, or already used approval token."
+            }
+        
+        # 2. Fetch the current trade within the SAME transaction
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, status, proposal_hash, policy_version, entry_price, quantity, stop_loss
+            FROM trades WHERE id = ?
+        """, (trade_id,))
+        row = cursor.fetchone()
+        
+        if not row:
+            conn.rollback()
+            conn.close()
+            return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
+        
+        trade_status = row[1]
+        trade_hash = row[2]
+        trade_policy = row[3]
+        
+        # 3. Verify current status is AWAITING_APPROVAL
+        if trade_status != TradeStatus.AWAITING_APPROVAL.value:
+            conn.rollback()
+            conn.close()
+            return {
+                "status": "REJECTED",
+                "reason": f"Trade {trade_id} is '{trade_status}', must be 'awaiting_approval'."
+            }
+        
+        # 4. 🔒 CRITICAL: Verify token hash matches the CURRENT trade hash
+        if token_hash != trade_hash:
+            conn.rollback()
+            conn.close()
+            return {
+                "status": "REJECTED",
+                "reason": "PROPOSAL MISMATCH: Token hash does not match current trade hash.",
+                "token_hash": token_hash,
+                "trade_hash": trade_hash
+            }
+        
+        if token_policy != trade_policy:
+            conn.rollback()
+            conn.close()
+            return {
+                "status": "REJECTED",
+                "reason": "POLICY MISMATCH: Token policy version does not match current trade.",
+                "token_policy": token_policy,
+                "trade_policy": trade_policy
+            }
+        
+        # 5. Transition to APPROVED using the SAME connection
+        result = transition_trade(
+            trade_id,
+            TradeStatus.APPROVED,
+            ActorType.HUMAN,
+            {"approved_by": approved_by, "proposal_hash": token_hash},
+            conn=conn  # Pass the connection to stay in the same transaction
+        )
+        
+        if result["status"] != "SUCCESS":
+            conn.rollback()
+            conn.close()
+            return result
+        
+        # 6. COMMIT everything (token consumed + trade approved)
+        conn.commit()
+        conn.close()
+        
         return {
-            "status": "REJECTED",
-            "reason": "Invalid, expired, or already used approval token."
+            "status": "SUCCESS",
+            "trade_id": trade_id,
+            "new_status": TradeStatus.APPROVED.value,
+            "approved_by": approved_by,
+            "proposal_hash": token_hash,
+            "message": f"Trade {trade_id} approved by {approved_by}."
         }
-    
-    # 2. Now transition the trade to APPROVED.
-    # We use a fresh connection here because the token consumption already committed.
-    # This is intentionally separated because we want the token marked used immediately.
-    # If the transition fails, the token is already consumed. This is acceptable
-    # because we don't want the human to reuse the token, even if the DB update fails later.
-    result = transition_trade(
-        trade_id,
-        TradeStatus.APPROVED,
-        ActorType.HUMAN,
-        {"approved_by": approved_by, "proposal_hash": proposal_hash}
-    )
-    
-    if result["status"] != "SUCCESS":
-        # Token is already consumed, but we return the error.
-        # The human cannot retry with this token anyway.
-        return result
-    
-    return {
-        "status": "SUCCESS",
-        "trade_id": trade_id,
-        "new_status": TradeStatus.APPROVED.value,
-        "approved_by": approved_by,
-        "proposal_hash": proposal_hash,
-        "message": f"Trade {trade_id} approved by {approved_by}."
-    }
+        
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return {
+            "status": "ERROR",
+            "reason": f"Approval failed: {str(e)}"
+        }
 
 # ------------------------------------------------------------------
 # STEP 3: EXECUTE (requires APPROVED + hash match)
@@ -120,23 +183,17 @@ def execute_trade(
     execution_price: float,
     executed_by: str = "execution_gateway"
 ) -> Dict[str, Any]:
-    """
-    Executes a previously approved trade.
-    Actor is strictly EXECUTION_GATEWAY.
-    """
-    # 1. Fetch the trade
+    """Executes a previously approved trade. Actor is strictly EXECUTION_GATEWAY."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
     
-    # 2. Must be APPROVED
     if trade["status"] != TradeStatus.APPROVED.value:
         return {
             "status": "REJECTED",
             "reason": f"Trade {trade_id} is '{trade['status']}', must be 'approved' to execute."
         }
     
-    # 3. Get stored hash
     stored_hash = trade.get("proposal_hash")
     if not stored_hash:
         return {
@@ -144,7 +201,7 @@ def execute_trade(
             "reason": "No proposal hash. Trade may not have been approved correctly."
         }
     
-    # 4. Recompute hash to detect tampering
+    # Recompute hash to detect tampering
     proposal = TradeProposal(
         asset=trade["symbol"],
         side=trade["side"],
@@ -167,7 +224,6 @@ def execute_trade(
             "computed_hash": computed_hash
         }
     
-    # 5. Transition to EXECUTED via EXECUTION_GATEWAY
     result = transition_trade(
         trade_id,
         TradeStatus.EXECUTED,
@@ -183,7 +239,7 @@ def execute_trade(
     return result
 
 # ------------------------------------------------------------------
-# UNIFIED SCREEN (Risk + Guardrails) – uses state machine internally
+# UNIFIED SCREEN (Risk + Guardrails)
 # ------------------------------------------------------------------
 def screen_trade(trade_id: int) -> Dict[str, Any]:
     """Runs Risk Engine + Guardrails on an existing PROPOSED trade."""
@@ -204,7 +260,6 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
     size = trade["quantity"]
     balance = trade["portfolio_balance"]
     
-    # 1. Risk Engine
     risk_result = risk_management_mcp.evaluate_trade_risk(
         symbol=symbol, side=side, entry=entry, stop=stop, size=size, portfolio_balance=balance
     )
@@ -212,7 +267,6 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.RISK_ENGINE, {"risk_result": risk_result})
         return {"status": "REJECTED", "trade_id": trade_id, "reason": risk_result["reason"], "stage": "risk_engine"}
     
-    # 2. Guardrails
     exposure = guardrails_mcp.check_exposure_limit(size, entry)
     if exposure["status"] == "REJECTED":
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.GUARDRAIL, {"exposure_result": exposure})
@@ -223,7 +277,6 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.GUARDRAIL, {"breaker_result": breaker})
         return {"status": "REJECTED", "trade_id": trade_id, "reason": breaker["reason"], "stage": "circuit_breaker"}
     
-    # 3. All passed → update state
     transition_trade(trade_id, TradeStatus.RISK_CHECKED, ActorType.RISK_ENGINE)
     transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE)
     
