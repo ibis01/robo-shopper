@@ -136,10 +136,33 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
             conn.close()
             return {"status": "REJECTED", "reason": f"Trade {trade_id} is '{trade_status}', must be 'awaiting_approval'."}
         
+        # Defense-in-depth: recompute proposal hash and verify three-way match
+        # TOKEN HASH == TRADE HASH == COMPUTED HASH
+        proposal = TradeProposal(
+            asset=trade["symbol"] if "symbol" in trade else "BTC",
+            side=trade["side"] if "side" in trade else "long",
+            entry_price=entry,
+            stop_loss=stop,
+            take_profit=trade.get("take_profit"),
+            quantity=qty,
+            risk_percent=risk_pct,
+            risk_amount=risk_amt,
+            portfolio_balance_at_time=balance,
+            agent_reasoning=reasoning or "",
+            risk_decision="PASSED",
+            expires_at=datetime.fromisoformat(expires_at_str) if expires_at_str else datetime.now(timezone.utc) + timedelta(hours=24)
+        )
+        computed_hash = proposal.compute_hash()
+        
         if token_hash != trade_hash:
             conn.rollback()
             conn.close()
-            return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: hash differs."}
+            return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: token_hash != trade_hash."}
+        
+        if computed_hash != trade_hash:
+            conn.rollback()
+            conn.close()
+            return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: computed_hash != trade_hash."}
         if token_policy != trade_policy:
             conn.rollback()
             conn.close()
@@ -204,20 +227,20 @@ def execute_trade(
     if not stored_hash:
         return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    risk_percent = trade.get("risk_percent") or 0.02
+    risk_percent = trade.get("risk_percent")
+    if risk_percent is None:
+        return {"status": "REJECTED", "reason": "Missing risk_percent in trade record."}
     risk_amount = trade.get("risk_amount")
     if risk_amount is None:
-        entry = trade["entry_price"]
-        stop = trade["stop_loss"]
-        qty = trade["quantity"]
-        risk_amount = abs(entry - stop) * qty
+        return {"status": "REJECTED", "reason": "Missing risk_amount in trade record."}
     
-    portfolio_balance = trade.get("portfolio_balance") or 10000.0
+    portfolio_balance = trade.get("portfolio_balance")
+    if portfolio_balance is None:
+        return {"status": "REJECTED", "reason": "Missing portfolio_balance in trade record."}
     expires_at_str = trade.get("proposal_expires_at")
     if not expires_at_str:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=24)
-    else:
-        expires_at = datetime.fromisoformat(expires_at_str)
+        return {"status": "REJECTED", "reason": "Trade has no expiration set."}
+    expires_at = datetime.fromisoformat(expires_at_str)
     
     proposal = TradeProposal(
         asset=trade["symbol"],
