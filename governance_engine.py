@@ -18,7 +18,7 @@ import trade_memory_mcp
 # STEP 1: REQUEST APPROVAL (auto‑transitions PROPOSED -> AWAITING_APPROVAL)
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Atomic: PROPOSED -> RISK_CHECKED -> AWAITING_APPROVAL, then mint signed token."""
+    """Mint a one-time approval token for an already screened trade."""
     # --- Phase 1: verify trade has been screened ---
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
@@ -317,8 +317,13 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.GUARDRAIL, {"breaker_result": breaker})
         return {"status": "REJECTED", "trade_id": trade_id, "reason": breaker["reason"], "stage": "circuit_breaker"}
     
-    transition_trade(trade_id, TradeStatus.RISK_CHECKED, ActorType.RISK_ENGINE)
-    transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE)
+    result1 = transition_trade(trade_id, TradeStatus.RISK_CHECKED, ActorType.RISK_ENGINE)
+    if result1.get("status") not in ("SUCCESS", "success"):
+        return result1
+    
+    result2 = transition_trade(trade_id, TradeStatus.AWAITING_APPROVAL, ActorType.RISK_ENGINE)
+    if result2.get("status") not in ("SUCCESS", "success"):
+        return result2
     
     return {
         "status": "SUCCESS",

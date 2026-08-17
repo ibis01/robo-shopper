@@ -38,12 +38,22 @@ def clean_db():
     conn.close()
 
 
-def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000, stop=59500):
-    prop = propose_trade(symbol, side, quantity, entry, stop, reasoning="concurrent")
-    return prop["trade_id"]
+def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000, stop=59500, reasoning="test"):
+    prop = propose_trade(symbol, side, quantity, entry, stop, reasoning=reasoning)
     
     # Set realistic portfolio_balance for exposure calculations
     import sqlite3
+    from config import DB_PATH
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE trades SET portfolio_balance = 10000.0 WHERE id = ?",
+        (prop["trade_id"],)
+    )
+    conn.commit()
+    conn.close()
+    
+    return prop["trade_id"]
+
     from config import DB_PATH
     conn = sqlite3.connect(DB_PATH)
     conn.execute(

@@ -13,7 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from schemas import TradeStatus, ActorType
 from state_machine import transition_trade
 from tests.test_helpers import screen_and_request_approval
-from governance_engine import request_approval, approve_trade, execute_trade
+from governance_engine import request_approval, approve_trade, execute_trade, screen_trade
 from trade_memory_mcp import propose_trade, get_trade
 from config import DB_PATH
 
@@ -35,12 +35,22 @@ def clean_db():
     conn.close()
 
 
-def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000, stop=59500):
-    prop = propose_trade(symbol, side, quantity, entry, stop, reasoning="test")
-    return prop["trade_id"]
+def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000, stop=59500, reasoning="test"):
+    prop = propose_trade(symbol, side, quantity, entry, stop, reasoning=reasoning)
     
     # Set realistic portfolio_balance for exposure calculations
     import sqlite3
+    from config import DB_PATH
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "UPDATE trades SET portfolio_balance = 10000.0 WHERE id = ?",
+        (prop["trade_id"],)
+    )
+    conn.commit()
+    conn.close()
+    
+    return prop["trade_id"]
+
     from config import DB_PATH
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -53,8 +63,13 @@ def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000,
 
 def test_full_governance_pipeline(clean_db):
     tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
+    
+    # Explicit governance pipeline (not a helper)
+    screen_result = screen_trade(tid)
+    assert screen_result["status"] == "SUCCESS", f"Screening failed: {screen_result}"
+    
+    req = request_approval(tid)
+    assert req["status"] == "success", f"Request approval failed: {req}"
     token = req["approval_token"]
     
     approve_result = approve_trade(token)
