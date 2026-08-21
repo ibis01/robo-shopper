@@ -57,6 +57,7 @@ def dashboard_home(request: Request):
         <div id="pending-trades">Loading...</div>
     </div>
     <script>
+        // SECURITY FIX 1: No hardcoded API key. Uses HttpOnly cookies via credentials: 'include'
         async function loadTrades() {
             const res = await fetch('/api/pending_trades', { credentials: 'include' });
             if (res.status === 401) { document.getElementById('pending-trades').innerHTML = 'Unauthorized'; return; }
