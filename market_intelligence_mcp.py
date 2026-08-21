@@ -1,8 +1,9 @@
-# Paste the next Python block, then press Ctrl+D[201~from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Literal, Optional, Tuple
@@ -15,12 +16,20 @@ logging.basicConfig(level=logging.INFO)
 
 MarketOperation = Literal["ticker", "order_book", "ohlcv"]
 
-
 class MarketDataError(RuntimeError):
     def __init__(self, message: str, errors: Optional[List[Exception]] = None):
         super().__init__(message)
         self.errors = errors or []
 
+# ------------------------------------------------------------------
+# P0-2 FIX: Prompt Injection Hardening
+# ------------------------------------------------------------------
+def _sanitize_external_string(val: Any, max_len: int = 64) -> str:
+    """Strip control characters and limit length to prevent prompt injection via metadata."""
+    if not isinstance(val, str):
+        return str(val)[:max_len]
+    cleaned = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', val)
+    return cleaned[:max_len].strip()
 
 @dataclass(frozen=True)
 class MarketIntelligenceConfig:
@@ -45,7 +54,6 @@ class MarketIntelligenceConfig:
         )
         return [preferred] + [x for x in self.supported_exchanges if x != preferred]
 
-
 def _safe_float(value: Any) -> Optional[float]:
     try:
         if value is None:
@@ -53,7 +61,6 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
-
 
 def _safe_round(value: Any, ndigits: int = 8) -> Optional[float]:
     number = _safe_float(value)
@@ -66,12 +73,11 @@ def _safe_round(value: Any, ndigits: int = 8) -> Optional[float]:
         pass
     return round(number, ndigits)
 
-
 def _error_payload(tool: str, symbol: Optional[str], exc: Exception, **extra: Any) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
         "ok": False,
-        "tool": tool,
-        "symbol": symbol,
+        "tool": _sanitize_external_string(tool),
+        "symbol": _sanitize_external_string(symbol),
         "error": str(exc),
         "error_type": exc.__class__.__name__,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -80,7 +86,6 @@ def _error_payload(tool: str, symbol: Optional[str], exc: Exception, **extra: An
         payload["causes"] = [str(item) for item in exc.errors[:3]]
     payload.update(extra)
     return payload
-
 
 class PublicExchangeGateway:
     def __init__(self, config: MarketIntelligenceConfig):
@@ -167,7 +172,6 @@ class PublicExchangeGateway:
             errors=errors,
         )
 
-
 def _rsi(closes: pd.Series, period: int) -> pd.Series:
     delta = closes.diff()
     gain = delta.clip(lower=0.0)
@@ -188,7 +192,6 @@ def _rsi(closes: pd.Series, period: int) -> pd.Series:
     rsi[flat] = 50.0
 
     return rsi
-
 
 def _analyze_ohlcv(ohlcv: List[List[float]], config: MarketIntelligenceConfig) -> Dict[str, Any]:
     if not ohlcv:
@@ -310,7 +313,6 @@ def _analyze_ohlcv(ohlcv: List[List[float]], config: MarketIntelligenceConfig) -
         "last_candle_time": df["timestamp"].iloc[-1].isoformat(),
     }
 
-
 async def _get_spot_quote(gateway: PublicExchangeGateway, symbol: str) -> Dict[str, Any]:
     try:
         try:
@@ -342,8 +344,8 @@ async def _get_spot_quote(gateway: PublicExchangeGateway, symbol: str) -> Dict[s
         return {
             "ok": True,
             "tool": "get_spot_quote",
-            "exchange": result["exchange"],
-            "symbol": result["symbol"],
+            "exchange": _sanitize_external_string(result["exchange"]),
+            "symbol": _sanitize_external_string(result["symbol"]),
             "last": _safe_round(last, 8),
             "bid": _safe_round(bid, 8),
             "ask": _safe_round(ask, 8),
@@ -357,7 +359,6 @@ async def _get_spot_quote(gateway: PublicExchangeGateway, symbol: str) -> Dict[s
     except Exception as exc:
         logger.exception("get_spot_quote failed")
         return _error_payload("get_spot_quote", symbol, exc)
-
 
 async def _get_order_book_metrics(
     gateway: PublicExchangeGateway,
@@ -417,8 +418,8 @@ async def _get_order_book_metrics(
         return {
             "ok": True,
             "tool": "get_order_book_metrics",
-            "exchange": result["exchange"],
-            "symbol": result["symbol"],
+            "exchange": _sanitize_external_string(result["exchange"]),
+            "symbol": _sanitize_external_string(result["symbol"]),
             "levels": safe_limit,
             "best_bid": _safe_round(best_bid, 8),
             "best_ask": _safe_round(best_ask, 8),
@@ -433,7 +434,6 @@ async def _get_order_book_metrics(
     except Exception as exc:
         logger.exception("get_order_book_metrics failed")
         return _error_payload("get_order_book_metrics", symbol, exc)
-
 
 async def _get_technicals(
     gateway: PublicExchangeGateway,
@@ -495,8 +495,8 @@ async def _get_technicals(
         return {
             "ok": True,
             "tool": "analyze_technicals",
-            "exchange": result["exchange"],
-            "symbol": result["symbol"],
+            "exchange": _sanitize_external_string(result["exchange"]),
+            "symbol": _sanitize_external_string(result["symbol"]),
             "timeframe": resolved_timeframe,
             "candles_requested": safe_limit,
             "candles_used": len(payload),
@@ -506,7 +506,6 @@ async def _get_technicals(
     except Exception as exc:
         logger.exception("analyze_technicals failed")
         return _error_payload("analyze_technicals", symbol, exc, timeframe=timeframe)
-
 
 def register_market_intelligence_tools(mcp: Any, config: Optional[MarketIntelligenceConfig] = None) -> None:
     cfg = config or MarketIntelligenceConfig()
@@ -543,8 +542,6 @@ async def analyze_technicals(
     cfg = MarketIntelligenceConfig()
     gateway = PublicExchangeGateway(cfg)
     return await _get_technicals(gateway, cfg, symbol, timeframe, limit)
-
-
 
 if __name__ == "__main__":
     import json

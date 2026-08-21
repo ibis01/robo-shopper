@@ -155,12 +155,13 @@ async def run_qwen_agent():
 
             while True:
                 try:
-                    user_input = input("\n🧑 You: ")
+                    user_input = input("\n You: ")
                     if user_input.lower() in ("exit", "quit"):
                         break
 
                     messages.append({"role": "user", "content": user_input})
                     _proposed = False
+                    _rejected = False  # P0-1 FIX: Track rejection state
 
                     while True:
                         response = client.chat.completions.create(
@@ -200,9 +201,10 @@ async def run_qwen_agent():
 
                         if not msg.tool_calls:
                             print(f"\n🤖 Robo-Shopper:\n{msg.content}\n")
-                            if msg.content and ("onchainos" in msg.content or _proposed):
+                            # P0-1 FIX: Only prompt for execution if proposed AND not rejected
+                            if msg.content and ("onchainos" in msg.content or (_proposed and not _rejected)):
                                 telegram_notify.send_alert(msg.content)
-                                ans = input("\n⚡ Execute this command? [y/N]: ").strip().lower()
+                                ans = input("\n Execute this command? [y/N]: ").strip().lower()
                                 if ans in ("y", "yes"):
                                     print("✅ APPROVED - copy the command above to execute.")
                                 else:
@@ -212,7 +214,7 @@ async def run_qwen_agent():
                         for tool_call in msg.tool_calls:
                             name = tool_call.function.name
                             args = json.loads(tool_call.function.arguments or "{}")
-                            print(f"🛠️  [tool] {name}({args})")
+                            print(f"️  [tool] {name}({args})")
 
                             if name == 'propose_trade':
                                 _proposed = True
@@ -221,6 +223,10 @@ async def run_qwen_agent():
                             try:
                                 result = await session.call_tool(name, args)
                                 res_text = "\n".join([c.text for c in result.content if hasattr(c, "text")])
+                                
+                                # P0-1 FIX: Detect rejection from screen_trade
+                                if name == 'screen_trade' and 'REJECTED' in res_text.upper():
+                                    _rejected = True
                             except Exception as e:
                                 res_text = f"Error executing tool: {e}"
 

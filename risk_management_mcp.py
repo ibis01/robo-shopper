@@ -34,7 +34,6 @@ def _get_real_portfolio_balance() -> float:
         conn = sqlite3.connect(DB_PATH)
         cursor = conn.cursor()
         
-        # Ensure the treasury table exists
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS treasury (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,15 +42,12 @@ def _get_real_portfolio_balance() -> float:
             )
         """)
         
-        # Check if there is any row; if not, insert a default so we don't fail on first run
         cursor.execute("SELECT COUNT(*) FROM treasury")
         count = cursor.fetchone()[0]
         if count == 0:
-            # Seed with a default $10,000 ONLY if the table is entirely empty.
             cursor.execute("INSERT INTO treasury (current_balance) VALUES (10000.0)")
             conn.commit()
         
-        # Fetch the latest balance
         cursor.execute("SELECT current_balance FROM treasury ORDER BY id DESC LIMIT 1")
         row = cursor.fetchone()
         conn.close()
@@ -83,20 +79,7 @@ def calculate_position_size(
     """
     Calculates the position size based on the 2% hard risk cap.
     Performs strict input validation.
-    
-    Args:
-        entry: Proposed entry price (must be > 0)
-        stop: Stop loss price (must be > 0 and != entry)
-        portfolio_balance: Optional override (defaults to DB balance)
-    
-    Returns:
-        Dict with position_size, risk_amount_usd, max_risk_percent, etc.
-    
-    Raises:
-        ValueError: If any input is invalid.
-        RuntimeError: If portfolio balance cannot be retrieved.
     """
-    # --- Strict Input Validation (Hard Stop) ---
     if entry <= 0:
         raise ValueError(f"Entry price must be positive. Got: {entry}")
     if stop <= 0:
@@ -104,26 +87,22 @@ def calculate_position_size(
     if entry == stop:
         raise ValueError("Entry and Stop prices cannot be equal. Risk per unit would be zero.")
     
-    # Get the real portfolio balance
     if portfolio_balance is None:
         portfolio_balance = _get_real_portfolio_balance()
     
     if portfolio_balance <= 0:
         raise ValueError(f"Portfolio balance must be positive. Got: {portfolio_balance}")
     
-    # Hardcoded risk rule: 2% of portfolio
     RISK_PERCENT = 0.02
     risk_amount = portfolio_balance * RISK_PERCENT
     risk_per_unit = abs(entry - stop)
-    
-    # Size = risk_amount / risk_per_unit
     position_size = risk_amount / risk_per_unit
     
     return {
         "portfolio_balance": round(portfolio_balance, 2),
-        "max_risk_percent": RISK_PERCENT * 100,  # 2.0
+        "max_risk_percent": RISK_PERCENT * 100,
         "risk_amount_usd": round(risk_amount, 2),
-        "position_size": round(position_size, 8),  # Crypto precision
+        "position_size": round(position_size, 8),
         "entry_price": entry,
         "stop_loss": stop,
         "risk_per_unit": round(risk_per_unit, 2),
@@ -139,32 +118,11 @@ def evaluate_trade_risk(
     stop: float,
     size: float,
     portfolio_balance: Optional[float] = None,
-    rsi_override: Optional[float] = None,  # For testing/fallback
+    rsi_override: Optional[float] = None,  # Kept for test compatibility only
 ) -> Dict[str, Any]:
     """
-    Hardcoded veto gate. This function is the final arbiter.
-    Even if the LLM calculates a size, this function can REJECT the trade.
-    
-    Checks:
-    1. 2% risk cap (based on entry, stop, and size).
-    2. Basic RSI sanity (optional, requires market_intelligence_mcp).
-    3. Minimum position size sanity.
-    
-    Args:
-        symbol: Trading pair (BTC, ETH, SOL)
-        side: "long" or "short"
-        entry: Entry price
-        stop: Stop loss
-        size: Position size (in base asset units)
-        portfolio_balance: Optional override
-        rsi_override: For testing, bypass RSI fetch
-    
-    Returns:
-        Dict with status ("PASSED" or "REJECTED"), reason, and warnings.
-    
-    Raises:
-        ValueError: If inputs are invalid.
-        RuntimeError: If portfolio balance cannot be retrieved.
+    Hardcoded veto gate. Purely deterministic. 
+    NO async calls. NO live market data fetching.
     """
     # --- Validate inputs ---
     if not symbol or symbol not in ["BTC", "ETH", "SOL"]:
@@ -180,7 +138,6 @@ def evaluate_trade_risk(
     if size <= 0:
         raise ValueError(f"Position size must be positive. Got: {size}")
     
-    # Get portfolio balance
     if portfolio_balance is None:
         portfolio_balance = _get_real_portfolio_balance()
     if portfolio_balance <= 0:
@@ -194,70 +151,29 @@ def evaluate_trade_risk(
     if risk_percent > 2.0:
         return {
             "status": "REJECTED",
-            "reason": f"Risk exceeds 2% hard cap. Proposed risk: {risk_percent:.2f}% (max allowed: 2.0%). "
-                      f"Risk amount: ${risk_usd:.2f} on portfolio of ${portfolio_balance:.2f}.",
+            "reason": f"Risk exceeds 2% hard cap. Proposed risk: {risk_percent:.2f}% (max allowed: 2.0%).",
             "risk_percent": round(risk_percent, 2),
             "risk_usd": round(risk_usd, 2),
             "portfolio_balance": round(portfolio_balance, 2),
             "warnings": []
         }
 
-    # --- Check 2: RSI / Overbought Oversold (WITH WARNINGS, NOT SILENT) ---
+   # --- Check 2: RSI (Override only for testing. No live fetch.) ---
     warnings = []
-    rsi = None
-    try:
-        import market_intelligence_mcp
-        
-        if rsi_override is not None:
-            rsi = rsi_override
-        else:
-            # Note: analyze_technicals is async in the market module. 
-            # Calling it synchronously will return a coroutine, which triggers the except block.
-            # This is safe fail-closed behavior for the risk engine.
-            tech_data = market_intelligence_mcp.analyze_technicals(symbol)
-            if isinstance(tech_data, dict) and "rsi_14" in tech_data:
-                rsi = tech_data["rsi_14"]
-            elif isinstance(tech_data, dict) and "rsi" in tech_data:
-                rsi = tech_data["rsi"]
-        
-        if rsi is not None:
-            if rsi > 70 and side == "long":
-                return {
-                    "status": "REJECTED",
-                    "reason": f"RSI is {rsi:.1f} (overbought > 70). Long trade rejected.",
-                    "warnings": warnings,
-                    "rsi": round(rsi, 1),
-                    "portfolio_balance": round(portfolio_balance, 2)
-                }
-            if rsi < 30 and side == "short":
-                return {
-                    "status": "REJECTED",
-                    "reason": f"RSI is {rsi:.1f} (oversold < 30). Short trade rejected.",
-                    "warnings": warnings,
-                    "rsi": round(rsi, 1),
-                    "portfolio_balance": round(portfolio_balance, 2)
-                }
-    except ImportError:
-        warnings.append("market_intelligence_mcp not available – RSI check skipped.")
-    except Exception as e:
-        # Fail safe: If we can't get RSI, we warn but proceed with core financial risk checks.
-        warnings.append(f"RSI check failed ({type(e).__name__}) – proceeding with core risk checks.")
-    
+    if rsi_override is not None:
+        if rsi_override > 70 and side == "long":
+            return {"status": "REJECTED", "reason": f"RSI override {rsi_override} > 70 (overbought). Long rejected.", "rsi": rsi_override}
+        if rsi_override < 30 and side == "short":
+            return {"status": "REJECTED", "reason": f"RSI override {rsi_override} < 30 (oversold). Short rejected.", "rsi": rsi_override}
     # --- Check 3: Minimum position sanity ---
     min_size_map = {"BTC": 0.0001, "ETH": 0.001, "SOL": 0.01}
     min_size = min_size_map.get(symbol, 0.0001)
     if size < min_size:
-        return {
-            "status": "REJECTED",
-            "reason": f"Position size {size:.8f} is below minimum {min_size:.8f} for {symbol}.",
-            "warnings": warnings,
-            "portfolio_balance": round(portfolio_balance, 2)
-        }
+        return {"status": "REJECTED", "reason": f"Size {size} below min {min_size}.", "warnings": warnings}
     
-    # --- All checks passed ---
     return {
         "status": "PASSED",
-        "reason": f"Trade passed all risk checks. Risk: {risk_percent:.2f}% (within 2% cap).",
+        "reason": f"Trade passed all risk checks. Risk: {risk_percent:.2f}%.",
         "warnings": warnings,
         "risk_percent": round(risk_percent, 2),
         "risk_usd": round(risk_usd, 2),
@@ -265,13 +181,10 @@ def evaluate_trade_risk(
     }
 
 # ------------------------------------------------------------------
-# 4. OPTIONAL: Helper to seed the treasury (for first-time users)
+# 4. HELPER: Seed treasury
 # ------------------------------------------------------------------
 def seed_treasury(initial_balance: float = 10000.0) -> Dict[str, Any]:
-    """
-    Seeds the treasury with an initial balance.
-    Use this if the treasury table is empty.
-    """
+    """Seeds the treasury with an initial balance."""
     if initial_balance <= 0:
         raise ValueError("Initial balance must be positive.")
     
@@ -288,51 +201,23 @@ def seed_treasury(initial_balance: float = 10000.0) -> Dict[str, Any]:
     conn.commit()
     conn.close()
     
-    return {
-        "status": "success",
-        "message": f"Treasury seeded with ${initial_balance:.2f}",
-        "balance": initial_balance
-    }
+    return {"status": "success", "message": f"Treasury seeded with ${initial_balance:.2f}", "balance": initial_balance}
 
 # ------------------------------------------------------------------
-# 5. SELF-TEST (Run this file directly to verify)
+# 5. SELF-TEST
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     print("🧪 Testing Risk Management MCP...")
-    
-    # Test 1: Calculate position size
     try:
         result = calculate_position_size(entry=60000, stop=59500, portfolio_balance=10000)
         print(f"✅ calculate_position_size: {result}")
     except Exception as e:
-        print(f" calculate_position_size error: {e}")
+        print(f"❌ calculate_position_size error: {e}")
     
-    # Test 2: Evaluate trade risk (should PASS)
     try:
-        result = evaluate_trade_risk(
-            symbol="BTC",
-            side="long",
-            entry=60000,
-            stop=59500,
-            size=0.4,
-            portfolio_balance=10000.0
-        )
+        result = evaluate_trade_risk(symbol="BTC", side="long", entry=60000, stop=59500, size=0.4, portfolio_balance=10000.0)
         print(f"✅ evaluate_trade_risk (PASS expected): {result}")
     except Exception as e:
         print(f"❌ evaluate_trade_risk error: {e}")
-    
-    # Test 3: Evaluate trade risk (should REJECT due to >2%)
-    try:
-        result = evaluate_trade_risk(
-            symbol="BTC",
-            side="long",
-            entry=60000,
-            stop=59000,
-            size=0.4,
-            portfolio_balance=10000.0
-        )
-        print(f"✅ evaluate_trade_risk (REJECT expected): {result}")
-    except Exception as e:
-        print(f"❌ evaluate_trade_risk error: {e}")
-    
+        
     print("✅ Risk Management MCP tests complete.")

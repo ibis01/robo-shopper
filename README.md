@@ -1,47 +1,45 @@
-# ️ Robo-Shopper — Governed AI Finance Copilot
+# Robo-Shopper: Governed AI Finance Copilot
 
-**Agent proposes → Rulebook gates → Human approves → Ledger remembers.**
+**Agent Investigates → System Verifies → Policy Governs → Human Authorizes → Gateway Executes → Memory Records.**
 
-Robo-Shopper is a human-governed trading copilot built on the Model Context Protocol (MCP). It fuses market intelligence (spot, options, prediction markets, news sentiment) with a deterministic risk engine and persistent trade memory — and it **never moves user funds without explicit human approval**.
+Robo-Shopper is a human-governed, genuinely agentic trading copilot built on the Model Context Protocol (MCP). It fuses dynamic market intelligence with a deterministic risk engine and persistent trade memory. It is **not** an autonomous trading bot; it is a verifiable, evidence-first decision engine that **never moves user funds without explicit human approval**.
 
-> ⚠️ **Prototype Status**: Paper-trading only. Not financial advice. No private keys are ever requested or stored.
+> ⚠️ **Prototype Status:** Paper-trading and dry-run execution only. Not financial advice.
 
 ## 🏆 Orion Hackathon Alignment
 
-This submission is engineered to excel across the official Orion judging criteria:
+| Criterion           | Implementation in Robo-Shopper                                                                                                                                                              |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Agentic Quality** | Dynamically plans investigations, checks trade history _before_ sizing, assesses confidence, and detects anomalies (e.g., high exposure) before proposing.                                  |
+| **Security**        | Zero private key handling. Strict input validation. Tamper-evident cryptographic proposal hashing. One-time, expiring approval tokens. External data sanitization against prompt injection. |
+| **Reliability**     | 48/48 adversarial, concurrency, and risk tests passing. Explicit "Insufficient evidence" fail-closed protocol. No silent hallucinations.                                                    |
+| **Observability**   | Every decision generates a persistent, human-readable "Decision Dossier" in the web UI, tracing evidence, risk metrics, and authorization.                                                  |
+| **Execution**       | Canonical, deterministic tool routing. The LLM _cannot_ bypass the 2% per-trade risk cap or 20% portfolio exposure cap.                                                                     |
 
-- **Usefulness (9/10)**: Solves the real problem of AI hallucination in finance by enforcing a deterministic, human-governed risk layer. It provides actionable, evidence-backed trade proposals, not blind guesses.
-- **Execution (9/10)**: Features a fully functional, tested state machine (48/48 tests passing), one-time approval tokens, replay protection, and cryptographic proposal hashing. The `/api/trace/{trade_id}` endpoint provides complete observability.
-- **Originality (8/10)**: Unlike autonomous "black box" trading bots, Robo-Shopper pioneers a "Copilot + Deterministic Veto + Human Authorization" architecture, ensuring the AI investigates, but the rulebook and human decide.
+## 🛡️ Safety Model (Non-Negotiable)
 
-## ️ Safety Model (Non-Negotiable)
-
-Robo-Shopper is a **Human-Governed Copilot**, **not** an autonomous robot.
-
-1. **No Private Keys**: The agent NEVER stores, touches, or uses your private keys.
-2. **No Auto-Execution**: The agent ONLY outputs `onchainos` CLI commands. You copy and paste them into your own terminal.
-3. **Hardcoded Veto**: The `evaluate_trade_risk` and `calculate_position_size` tools apply deterministic rules **outside** the LLM's control. Even if the LLM hallucinates a 50% risk trade, the tool forces it to respect the 2% rule.
-4. **Treasury Autonomy (V3)**: The _treasury wallet_ (which collects the 2% fee) is autonomous ONLY for collecting fees and sweeping idle yield—it **never** executes discretionary trades.
+1. **No Private Keys**: The agent NEVER stores, touches, or uses private keys.
+2. **No Auto-Execution**: The agent ONLY outputs dry-run CLI commands. Human copy-paste is required.
+3. **Deterministic Veto**: Risk calculations (`calculate_position_size`, `evaluate_trade_risk`) are executed in Python, entirely outside the LLM's control. The LLM cannot be prompted to bypass the 2% risk or 20% exposure caps.
+4. **Tamper-Evident Governance**: Human approval is cryptographically bound to the exact proposal hash and policy version. If any parameter changes post-approval, execution is instantly rejected.
+5. **Prompt Injection Defense**: All external market metadata (symbols, exchange names) is sanitized and length-limited before reaching the LLM context.
 
 ## 🏗️ Architecture
 
-- **Agent Layer**: `qwen_agent.py` (Dynamic investigation via MCP tools)
-- **Governance Layer**: `state_machine.py`, `governance_engine.py` (Explicit lifecycle, proposal hashing)
-- **Risk Engine**: `risk_management_mcp.py` (Deterministic 2% cap, RSI vetoes)
-- **Memory**: `trade_memory_mcp.py` (SQLite ledger, persistent audit trail)
-- **Observability**: `dashboard.py` (FastAPI UI, Decision Dossier API)
+1. **LLM Agent (`qwen_agent.py`)**: Plans investigations, gathers evidence via MCP tools, synthesizes findings, and proposes trades.
+2. **MCP Server (`main_server.py`)**: Canonical tool registry and direct pass-through routing.
+3. **Market Intelligence (`market_intelligence_mcp.py`)**: Live data via CCXT (with Yahoo Finance failover).
+4. **Risk Engine (`risk_management_mcp.py`)**: Hardcoded financial vetoes (2% risk, 20% exposure). Purely deterministic.
+5. **Governance (`governance_engine.py`)**: State machine, proposal hashing, and one-time approval tokens.
+6. **Memory (`trade_memory_mcp.py`)**: SQLite ledger with full lifecycle tracking.
+7. **Observability (`dashboard.py`)**: FastAPI web UI featuring the Decision Dossier.
 
-## 🚀 Setup & Demo
+## 🚀 Quick Start
 
-1. **Install**: `pip install -r requirements.txt`
-2. **Run Dashboard**: `python dashboard.py` (Visit `http://localhost:8003`)
-3. **Run Agent**: `python qwen_agent.py`
-4. **Hero Workflow**: Ask the agent: _"Investigate ETH and determine whether a $500 position fits my current risk policy."_ Watch it gather evidence, pass the risk gates, and request your approval.
-
-## Testing
-
-The core logic is protected by 48 automated tests covering adversarial paths, concurrency, and governance bypasses.
-
-```bash
-pytest tests/ -v
-```
+1. **Clone & Install**:
+   ```bash
+   git clone https://github.com/ibis01/robo-shopper.git
+   cd robo-shopper
+   python -m venv .venv && source .venv/bin/activate
+   pip install -r requirements.txt
+   ```
