@@ -11,7 +11,9 @@ from pydantic import BaseModel
 from typing import Optional, Dict, Any
 
 from config import DB_PATH
-from schemas import TradeStatus
+from schemas import TradeStatus  
+from governance_engine import dashboard_approve_trade, dashboard_reject_trade
+
 
 app = FastAPI(title="Robo-Shopper Institutional Desk")
 
