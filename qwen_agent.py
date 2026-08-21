@@ -80,7 +80,7 @@ except ImportError:
             print(f"📨 [Telegram stub] {msg}")
 
 # ------------------------------------------------------------------
-# SYSTEM PROMPT (Hardened Agentic Behavior + Zero Hallucination)
+# SYSTEM PROMPT (Hardened Agentic Behavior + Zero Hallucination + Trust Boundary)
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """
 You are Robo-Shopper, an institutional-grade, genuinely agentic AI finance copilot. 
@@ -92,8 +92,8 @@ AI INVESTIGATES → SYSTEM VERIFIES → POLICY GOVERNS → HUMAN AUTHORIZES → 
 AVAILABLE TOOLS & EXACT PARAMETERS:
 1. Market Intel: `analyze_technicals(symbol: str)`
 2. Risk & Governance: 
-   - `calculate_position_size(entry: float, stop: float, portfolio_balance: float)`
-   - `evaluate_trade_risk(symbol: str, side: str, entry: float, stop: float, size: float, portfolio_balance: float)`
+   - `calculate_position_size(entry: float, stop: float)`
+   - `evaluate_trade_risk(symbol: str, side: str, entry: float, stop: float, size: float)`
 3. Memory & Ledger: 
    - `get_trade_history(limit: int)`
    - `propose_trade(symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float (optional), reasoning: str (optional))`
@@ -117,6 +117,7 @@ Once you have sufficient evidence and a viable proposal, you MUST ensure it pass
 CRITICAL SAFETY RULES:
 - NEVER fabricate market data, prices, indicators, or financial information.
 - NEVER use placeholder strings. Use exact numerical values from tool outputs.
+- NEVER attempt to pass a portfolio_balance to risk tools. The system fetches the authoritative balance from the trusted treasury automatically.
 - NEVER execute trades autonomously. Always request explicit human approval after `screen_trade`.
 - If a tool fails, report: "Insufficient evidence due to tool failure: [tool name]." FAIL SAFE > FAIL SILENT.
 """
@@ -155,13 +156,13 @@ async def run_qwen_agent():
 
             while True:
                 try:
-                    user_input = input("\n You: ")
+                    user_input = input("\n🧑 You: ")
                     if user_input.lower() in ("exit", "quit"):
                         break
 
                     messages.append({"role": "user", "content": user_input})
                     _proposed = False
-                    _rejected = False  # P0-1 FIX: Track rejection state
+                    _rejected = False
 
                     while True:
                         response = client.chat.completions.create(
@@ -201,10 +202,9 @@ async def run_qwen_agent():
 
                         if not msg.tool_calls:
                             print(f"\n🤖 Robo-Shopper:\n{msg.content}\n")
-                            # P0-1 FIX: Only prompt for execution if proposed AND not rejected
                             if msg.content and ("onchainos" in msg.content or (_proposed and not _rejected)):
                                 telegram_notify.send_alert(msg.content)
-                                ans = input("\n Execute this command? [y/N]: ").strip().lower()
+                                ans = input("\n⚡ Execute this command? [y/N]: ").strip().lower()
                                 if ans in ("y", "yes"):
                                     print("✅ APPROVED - copy the command above to execute.")
                                 else:
@@ -214,7 +214,7 @@ async def run_qwen_agent():
                         for tool_call in msg.tool_calls:
                             name = tool_call.function.name
                             args = json.loads(tool_call.function.arguments or "{}")
-                            print(f"️  [tool] {name}({args})")
+                            print(f"🛠️  [tool] {name}({args})")
 
                             if name == 'propose_trade':
                                 _proposed = True
@@ -224,7 +224,6 @@ async def run_qwen_agent():
                                 result = await session.call_tool(name, args)
                                 res_text = "\n".join([c.text for c in result.content if hasattr(c, "text")])
                                 
-                                # P0-1 FIX: Detect rejection from screen_trade
                                 if name == 'screen_trade' and 'REJECTED' in res_text.upper():
                                     _rejected = True
                             except Exception as e:

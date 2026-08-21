@@ -2,17 +2,16 @@
 Robo-Shopper V4 - Trade Memory MCP (Sprint 5).
 Manages the SQLite ledger. 
 State mutations are delegated to state_machine.py.
+TRUST BOUNDARY: Portfolio balance is always fetched from the trusted treasury.
 """
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, Any
 
 from config import DB_PATH
-
-# Default portfolio balance used when a proposal is created without one
-DEFAULT_PORTFOLIO_BALANCE = 10000.0
 from schemas import TradeStatus
 from state_machine import transition_trade, ActorType
+from risk_management_mcp import _get_real_portfolio_balance
 
 # ------------------------------------------------------------------
 # PROPOSE A TRADE
@@ -24,16 +23,17 @@ def propose_trade(
     entry_price: float,
     stop_loss: float,
     take_profit: Optional[float] = None,
-    reasoning: Optional[str] = None,
-    portfolio_balance: Optional[float] = None
+    reasoning: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Logs a new trade proposal with status = PROPOSED, storing risk and expiration."""
+    """
+    Logs a new trade proposal with status = PROPOSED, storing risk and expiration.
+    TRUST BOUNDARY: Persists the authoritative balance from treasury, ignoring LLM input.
+    """
     if not symbol or not side or quantity <= 0 or entry_price <= 0 or stop_loss <= 0:
         raise ValueError("Invalid trade parameters.")
     
-    # Persist a real portfolio_balance at creation (fail-closed later reads this value)
-    if portfolio_balance is None or portfolio_balance <= 0:
-        portfolio_balance = DEFAULT_PORTFOLIO_BALANCE
+    # TRUSTED SOURCE: Fetch and persist the real balance
+    portfolio_balance = _get_real_portfolio_balance()
 
     # Compute risk metrics
     risk_per_unit = abs(entry_price - stop_loss)
@@ -66,7 +66,8 @@ def propose_trade(
         "status": "success",
         "trade_id": trade_id,
         "message": f"Trade {trade_id} proposed.",
-        "current_status": TradeStatus.PROPOSED.value
+        "current_status": TradeStatus.PROPOSED.value,
+        "portfolio_balance_used": round(portfolio_balance, 2)
     }
 
 # ------------------------------------------------------------------

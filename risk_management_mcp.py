@@ -5,7 +5,7 @@ Implements deterministic risk controls that CANNOT be bypassed by the LLM.
 - 2% hard cap on per-trade risk.
 - Validates all financial inputs.
 - HARD STOP on missing portfolio balance (no silent mock fallback).
-- Exposes both calculate_position_size and evaluate_trade_risk.
+- TRUST BOUNDARY: Portfolio balance is ALWAYS fetched from the trusted treasury.
 """
 import os
 import sqlite3
@@ -73,12 +73,11 @@ def _get_real_portfolio_balance() -> float:
 # ------------------------------------------------------------------
 def calculate_position_size(
     entry: float, 
-    stop: float, 
-    portfolio_balance: Optional[float] = None
+    stop: float
 ) -> Dict[str, Any]:
     """
     Calculates the position size based on the 2% hard risk cap.
-    Performs strict input validation.
+    TRUST BOUNDARY: Always fetches authoritative balance from treasury.
     """
     if entry <= 0:
         raise ValueError(f"Entry price must be positive. Got: {entry}")
@@ -87,8 +86,8 @@ def calculate_position_size(
     if entry == stop:
         raise ValueError("Entry and Stop prices cannot be equal. Risk per unit would be zero.")
     
-    if portfolio_balance is None:
-        portfolio_balance = _get_real_portfolio_balance()
+    # TRUSTED SOURCE: Never accept LLM override
+    portfolio_balance = _get_real_portfolio_balance()
     
     if portfolio_balance <= 0:
         raise ValueError(f"Portfolio balance must be positive. Got: {portfolio_balance}")
@@ -117,14 +116,12 @@ def evaluate_trade_risk(
     entry: float,
     stop: float,
     size: float,
-    portfolio_balance: Optional[float] = None,
-    rsi_override: Optional[float] = None,  # Kept for test compatibility only
+    rsi_override: Optional[float] = None,
 ) -> Dict[str, Any]:
     """
-    Hardcoded veto gate. Purely deterministic. 
-    NO async calls. NO live market data fetching.
+    Hardcoded veto gate. Purely deterministic.
+    TRUST BOUNDARY: Always fetches authoritative balance from treasury.
     """
-    # --- Validate inputs ---
     if not symbol or symbol not in ["BTC", "ETH", "SOL"]:
         raise ValueError(f"Invalid symbol. Must be BTC, ETH, or SOL. Got: {symbol}")
     if side not in ["long", "short"]:
@@ -138,8 +135,8 @@ def evaluate_trade_risk(
     if size <= 0:
         raise ValueError(f"Position size must be positive. Got: {size}")
     
-    if portfolio_balance is None:
-        portfolio_balance = _get_real_portfolio_balance()
+    # TRUSTED SOURCE: Never accept LLM override
+    portfolio_balance = _get_real_portfolio_balance()
     if portfolio_balance <= 0:
         raise ValueError(f"Portfolio balance must be positive. Got: {portfolio_balance}")
     
@@ -158,13 +155,14 @@ def evaluate_trade_risk(
             "warnings": []
         }
 
-   # --- Check 2: RSI (Override only for testing. No live fetch.) ---
+    # --- Check 2: RSI (Override only for testing. No live fetch.) ---
     warnings = []
     if rsi_override is not None:
         if rsi_override > 70 and side == "long":
             return {"status": "REJECTED", "reason": f"RSI override {rsi_override} > 70 (overbought). Long rejected.", "rsi": rsi_override}
         if rsi_override < 30 and side == "short":
             return {"status": "REJECTED", "reason": f"RSI override {rsi_override} < 30 (oversold). Short rejected.", "rsi": rsi_override}
+
     # --- Check 3: Minimum position sanity ---
     min_size_map = {"BTC": 0.0001, "ETH": 0.001, "SOL": 0.01}
     min_size = min_size_map.get(symbol, 0.0001)
@@ -209,13 +207,13 @@ def seed_treasury(initial_balance: float = 10000.0) -> Dict[str, Any]:
 if __name__ == "__main__":
     print("🧪 Testing Risk Management MCP...")
     try:
-        result = calculate_position_size(entry=60000, stop=59500, portfolio_balance=10000)
+        result = calculate_position_size(entry=60000, stop=59500)
         print(f"✅ calculate_position_size: {result}")
     except Exception as e:
         print(f"❌ calculate_position_size error: {e}")
     
     try:
-        result = evaluate_trade_risk(symbol="BTC", side="long", entry=60000, stop=59500, size=0.4, portfolio_balance=10000.0)
+        result = evaluate_trade_risk(symbol="BTC", side="long", entry=60000, stop=59500, size=0.4)
         print(f"✅ evaluate_trade_risk (PASS expected): {result}")
     except Exception as e:
         print(f"❌ evaluate_trade_risk error: {e}")

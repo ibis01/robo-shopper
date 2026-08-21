@@ -3,6 +3,7 @@
 Robo-Shopper V4 - Universal MCP Tool Registry.
 Exposes ALL tools: Market Intel, Risk, Memory, Execution.
 Governance is enforced via explicit tool routing.
+TRUST BOUNDARY: Portfolio balance is never accepted from LLM.
 """
 import json
 import asyncio
@@ -60,8 +61,7 @@ async def handle_list_tools() -> list[types.Tool]:
                 "type": "object",
                 "properties": {
                     "entry": {"type": "number", "description": "Proposed entry price"},
-                    "stop": {"type": "number", "description": "Stop loss price"},
-                    "portfolio_balance": {"type": "number", "description": "Optional override for portfolio balance (defaults to DB)"}
+                    "stop": {"type": "number", "description": "Stop loss price"}
                 },
                 "required": ["entry", "stop"]
             }
@@ -77,7 +77,7 @@ async def handle_list_tools() -> list[types.Tool]:
                     "entry": {"type": "number"},
                     "stop": {"type": "number"},
                     "size": {"type": "number"},
-                    "portfolio_balance": {"type": "number"}
+                    "rsi_override": {"type": "number", "description": "Optional RSI override for testing"}
                 },
                 "required": ["symbol", "side", "entry", "stop", "size"]
             }
@@ -144,7 +144,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
         # ---------- MARKET INTELLIGENCE ----------
         elif name == "analyze_technicals":
-            # P0 FIX: Added 'await' because the underlying function is async.
             result = await market_intelligence_mcp.analyze_technicals(
                 symbol=args.get("symbol", "BTC")
             )
@@ -153,8 +152,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         elif name == "calculate_position_size":
             result = risk_management_mcp.calculate_position_size(
                 entry=args.get("entry"),
-                stop=args.get("stop"),
-                portfolio_balance=args.get("portfolio_balance")
+                stop=args.get("stop")
             )
 
         elif name == "evaluate_trade_risk":
@@ -164,7 +162,7 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                 entry=args.get("entry"),
                 stop=args.get("stop"),
                 size=args.get("size"),
-                portfolio_balance=args.get("portfolio_balance")
+                rsi_override=args.get("rsi_override")
             )
 
         # ---------- MEMORY ----------
@@ -172,7 +170,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             result = trade_memory_mcp.get_trade_history(args.get("limit", 10))
 
         elif name == "propose_trade":
-            # CANONICAL ROUTING: Direct pass-through. No translation layer.
             result = trade_memory_mcp.propose_trade(
                 symbol=args.get("symbol"),
                 side=args.get("side"),
@@ -198,7 +195,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
         return [types.TextContent(type="text", text=str(result))]
 
     except Exception as exc:
-        # P0 FIX: Return explicit error to LLM to trigger "Insufficient evidence" protocol
         logging.exception(f"Tool {name} failed")
         error_msg = (
             f"ERROR: Tool '{name}' failed with exception: {str(exc)}. "

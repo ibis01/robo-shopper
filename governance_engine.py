@@ -332,10 +332,10 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
     entry = trade["entry_price"]
     stop = trade["stop_loss"]
     size = trade["quantity"]
-    balance = trade["portfolio_balance"]
     
+    # TRUST BOUNDARY: evaluate_trade_risk fetches authoritative balance internally.
     risk_result = risk_management_mcp.evaluate_trade_risk(
-        symbol=symbol, side=side, entry=entry, stop=stop, size=size, portfolio_balance=balance
+        symbol=symbol, side=side, entry=entry, stop=stop, size=size
     )
     if risk_result["status"] == "REJECTED":
         transition_trade(trade_id, TradeStatus.REJECTED, ActorType.RISK_ENGINE, {"risk_result": risk_result})
