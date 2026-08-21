@@ -531,6 +531,20 @@ def register_market_intelligence_tools(mcp: Any, config: Optional[MarketIntellig
         """Calculate RSI, SMA trend, support/resistance, and signal."""
         return await _get_technicals(gateway, cfg, symbol, timeframe, limit)
 
+# ------------------------------------------------------------------
+# MODULE-LEVEL EXPORTS (For direct calling by main_server.py)
+# ------------------------------------------------------------------
+async def analyze_technicals(
+    symbol: str,
+    timeframe: str = "1h",
+    limit: int = 50,
+) -> Dict[str, Any]:
+    """Module-level wrapper for analyze_technicals to be called by main_server.py"""
+    cfg = MarketIntelligenceConfig()
+    gateway = PublicExchangeGateway(cfg)
+    return await _get_technicals(gateway, cfg, symbol, timeframe, limit)
+
+
 
 if __name__ == "__main__":
     import json

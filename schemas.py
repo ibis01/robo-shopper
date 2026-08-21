@@ -57,7 +57,7 @@ class TradeProposal(BaseModel):
     portfolio_balance_at_time: float
     
     # Agent reasoning (LLM's justification, for human review)
-    agent_reasoning: str
+    agent_reasoning: Optional[str] = ''
     
     # Risk engine decision (PASSED/REJECTED by deterministic rulebook)
     risk_decision: str
