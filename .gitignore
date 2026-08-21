@@ -6,3 +6,17 @@ trades.db
 voice.log
 voice.pid
 .DS_Store
+
+# V4 hygiene
+venv/
+.venv/
+ngrok
+*.tgz
+*.mp4
+.env
+trades.db
+__pycache__/
+*.pyc
+venv/
+robo-shopper/
+scripts/
