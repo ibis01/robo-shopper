@@ -592,3 +592,53 @@ def dashboard_reject_trade(trade_id: int, reason: str = "Rejected via dashboard"
 
     # Delegate to the state machine
     return transition_trade(trade_id, TradeStatus.REJECTED, ActorType.HUMAN, {"reason": reason})
+
+# ------------------------------------------------------------------
+# DASHBOARD GOVERNANCE BRIDGE (Server-Side Token Resolution)
+# ------------------------------------------------------------------
+def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
+    """
+    Resolves a trade_id to its server-side approval token and delegates 
+    to the existing cryptographic approve_trade() primitive.
+    The browser NEVER sees the token.
+    """
+    # 1. Verify trade exists and is in the correct state
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": "Trade not found."}
+    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+        return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
+
+    # 2. Retrieve the server-side pending authorization token
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT token FROM approval_tokens WHERE trade_id = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1", 
+        (trade_id,)
+    )
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return {"status": "ERROR", "reason": "No active approval token found for this trade."}
+
+    # 3. Delegate to existing cryptographic governance (preserves hash/policy/expiry checks)
+    return approve_trade(row[0], approved_by="dashboard_ui")
+
+def dashboard_reject_trade(trade_id: int) -> Dict[str, Any]:
+    """
+    Uses the canonical state machine to reject the trade.
+    Does not delete the trade or bypass governance.
+    """
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": "Trade not found."}
+    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+        return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
+
+    return transition_trade(
+        trade_id, 
+        TradeStatus.REJECTED, 
+        ActorType.HUMAN, 
+        {"reason": "Rejected via dashboard"}
+    )
