@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Robo-Shopper V4 - Universal MCP Tool Registry (Sprint 5).
-Exposes ALL tools: Market Intel, Risk, Memory, Execution, Options, Prediction, News.
+Robo-Shopper V4 - Universal MCP Tool Registry.
+Exposes ALL tools: Market Intel, Risk, Memory, Execution.
 Governance is enforced via explicit tool routing.
 """
 import json
 import asyncio
+import logging
 from mcp.server import Server, NotificationOptions
 from mcp.server.models import InitializationOptions
 import mcp.server.stdio
@@ -22,7 +23,7 @@ import guardrails_mcp
 server = Server("robo-shopper-universal")
 
 # ------------------------------------------------------------------
-# 1. TOOL REGISTRY (All available functions)
+# 1. TOOL REGISTRY (Canonical Schemas)
 # ------------------------------------------------------------------
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -51,7 +52,7 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol"]
             }
         ),
-        # ---------- RISK & GOVERNANCE (HARDENED) ----------
+        # ---------- RISK & GOVERNANCE ----------
         types.Tool(
             name="calculate_position_size",
             description="Calculate position size based on the 2% hard risk cap and real portfolio balance",
@@ -98,15 +99,15 @@ async def handle_list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string"},
-                    "side": {"type": "string", "enum": ["long", "short"]},
-                    "size": {"type": "number", "description": "Position size in base asset units"},
-                    "entry": {"type": "number", "description": "Proposed entry price"},
-                    "stop": {"type": "number", "description": "Stop loss price"},
+                    "symbol": {"type": "string", "description": "Trading pair (BTC, ETH, SOL)"},
+                    "side": {"type": "string", "enum": ["long", "short"], "description": "Trade direction"},
+                    "quantity": {"type": "number", "description": "Position size in base asset units"},
+                    "entry_price": {"type": "number", "description": "Proposed entry price"},
+                    "stop_loss": {"type": "number", "description": "Stop loss price"},
                     "take_profit": {"type": "number", "description": "Optional take profit price"},
                     "reasoning": {"type": "string", "description": "Agent reasoning for the trade"}
                 },
-                "required": ["symbol", "side", "size", "entry", "stop"]
+                "required": ["symbol", "side", "quantity", "entry_price", "stop_loss"]
             }
         ),
         # ---------- EXECUTION (DRY-RUN ONLY) ----------
@@ -128,7 +129,7 @@ async def handle_list_tools() -> list[types.Tool]:
     return tools
 
 # ------------------------------------------------------------------
-# 2. TOOL ROUTING (Executes the actual logic)
+# 2. TOOL ROUTING (Direct Pass-Through)
 # ------------------------------------------------------------------
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: dict | None) -> list[types.TextContent]:
@@ -171,19 +172,18 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
             result = trade_memory_mcp.get_trade_history(args.get("limit", 10))
 
         elif name == "propose_trade":
-            # CRITICAL FIX: Map LLM schema names (size, entry, stop) to actual Python function parameters
+            # CANONICAL ROUTING: Direct pass-through. No translation layer.
             result = trade_memory_mcp.propose_trade(
                 symbol=args.get("symbol"),
                 side=args.get("side"),
-                quantity=args.get("size"),       # LLM sends 'size', function expects 'quantity'
-                entry_price=args.get("entry"),   # LLM sends 'entry', function expects 'entry_price'
-                stop_loss=args.get("stop"),      # LLM sends 'stop', function expects 'stop_loss'
+                quantity=args.get("quantity"),
+                entry_price=args.get("entry_price"),
+                stop_loss=args.get("stop_loss"),
                 take_profit=args.get("take_profit"),
                 reasoning=args.get("reasoning", "")
             )
 
         elif name == "format_onchainos_command":
-            # Safe dry-run command generation
             result = {
                 "status": "success", 
                 "command": f"onchainos {args.get('side', 'buy')} {args.get('amount', 0)} {args.get('symbol', 'BTC')}"
@@ -199,7 +199,6 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
 
     except Exception as exc:
         # P0 FIX: Return explicit error to LLM to trigger "Insufficient evidence" protocol
-        import logging
         logging.exception(f"Tool {name} failed")
         error_msg = (
             f"ERROR: Tool '{name}' failed with exception: {str(exc)}. "

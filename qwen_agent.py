@@ -12,10 +12,7 @@ from mcp.client.stdio import stdio_client
 # HELPER: Robust tool call extraction from text
 # ------------------------------------------------------------------
 def extract_tool_calls_from_text(text: str):
-    """
-    Robustly extract JSON tool call objects from model text output.
-    Handles nested JSON objects and ignores conversational text.
-    """
+    """Robustly extract JSON tool call objects from model text output."""
     calls = []
     decoder = json.JSONDecoder()
     for match in re.finditer(r'\{', text):
@@ -29,21 +26,19 @@ def extract_tool_calls_from_text(text: str):
     return calls
 
 # ------------------------------------------------------------------
-# LLM Adapter Initialization (Prioritize Grok)
+# LLM Adapter Initialization (Prioritize OpenRouter/Groq)
 # ------------------------------------------------------------------
 def _get_grok_client():
-    """Check for OpenRouter API key and return configured client if found."""
+    """Check for API key and return configured client if found."""
     api_key = (
         os.environ.get("OPENROUTER_API_KEY") 
         or os.environ.get("GROQ_API_KEY") 
         or os.environ.get("GROK_API_KEY")
     )
     if api_key:
-        # Detect provider by key prefix
         if api_key.startswith("sk-or-"):
             provider = "openrouter"
             base_url = "https://openrouter.ai/api/v1"
-            # qwen-2.5-72b-instruct is highly reliable, fast, and excellent at tool-calling on OpenRouter
             model = "qwen/qwen-2.5-72b-instruct"
             print(f"✅ OpenRouter API key detected. Using model: {model}")
         elif api_key.startswith("gsk_"):
@@ -55,25 +50,19 @@ def _get_grok_client():
             provider = "unknown"
             base_url = "https://api.x.ai/v1"
             model = "grok-2"
-            print(f"⚠️ Unknown API key format. Trying xAI endpoint.")
+            print(f"️ Unknown API key format. Trying xAI endpoint.")
         
-        return OpenAI(
-            base_url=base_url, 
-            api_key=api_key, 
-            timeout=120.0
-        ), model, provider
+        return OpenAI(base_url=base_url, api_key=api_key, timeout=120.0), model, provider
     return None
-# 1. Try Grok first
+
 _grok_result = _get_grok_client()
 if _grok_result:
     client, MODEL, _PROVIDER = _grok_result
 else:
-    # 2. Fall back to local adapter
     try:
         from llm_adapter import make_client
         client, MODEL, _PROVIDER = make_client()
     except ImportError:
-        # 3. Ultimate fallback to Ollama
         base_url = os.environ.get("OLLAMA_HOST", "http://localhost:11434") + "/v1"
         client, MODEL, _PROVIDER = OpenAI(base_url=base_url, api_key="ollama"), "llama3.1:8b", "ollama"
 
@@ -91,7 +80,7 @@ except ImportError:
             print(f"📨 [Telegram stub] {msg}")
 
 # ------------------------------------------------------------------
-# SYSTEM PROMPT (Dynamic Investigation + Strict Anti-Hallucination)
+# SYSTEM PROMPT (Strict Anti-Hallucination & Canonical Signatures)
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """
 You are Robo-Shopper, an institutional-grade, governed Universal Finance Copilot. 
@@ -109,7 +98,7 @@ AVAILABLE TOOLS & EXACT PARAMETERS (Use ONLY these):
 
 CRITICAL: EVIDENCE-FIRST & NO PLACEHOLDERS PROTOCOL (Non-Negotiable)
 - NEVER fabricate market data, prices, indicators, or financial information.
-- NEVER use placeholder strings (e.g., "SIZE_FROM_TOOL"). You MUST use the exact numerical values returned by previous tool calls.
+- NEVER use placeholder strings (e.g., "SIZE_FROM_TOOL", "TAKE_PROFIT_FROM_USER"). You MUST use the exact numerical values returned by previous tool calls.
 - If a tool call fails, report the failure. State: "Insufficient evidence due to tool failure: [tool name]."
 - Prefer "I don't know" over hallucinating certainty. FAIL SAFE > FAIL SILENT.
 
@@ -142,7 +131,7 @@ def mcp_to_openai_tools(mcp_tools):
     return tools
 
 async def run_qwen_agent():
-    print(" Connecting to Robo-Shopper Finance Copilot MCP server...")
+    print("🔌 Connecting to Robo-Shopper Finance Copilot MCP server...")
 
     server_params = StdioServerParameters(
         command=sys.executable,
@@ -167,7 +156,7 @@ async def run_qwen_agent():
                         break
 
                     messages.append({"role": "user", "content": user_input})
-                    _proposed = False  # Track if a trade was proposed in this turn
+                    _proposed = False
 
                     while True:
                         response = client.chat.completions.create(
@@ -179,20 +168,15 @@ async def run_qwen_agent():
                         )
 
                         msg = response.choices[0].message
-
-                        # Format message for history
                         msg_dict = {"role": msg.role, "content": msg.content}
                         if msg.tool_calls:
                             msg_dict["tool_calls"] = [tc.model_dump() for tc in msg.tool_calls]
                         messages.append(msg_dict)
 
-                        # If no tool_calls, check if content contains JSON tool calls (fallback)
                         if not msg.tool_calls and msg.content:
                             parsed_calls = extract_tool_calls_from_text(msg.content)
-                            
                             if parsed_calls:
                                 print("🔄 Intercepted JSON tool calls from model output...")
-                                
                                 class FakeToolCall:
                                     def __init__(self, name, args, idx):
                                         self.id = f"call_local_{idx}"
@@ -201,7 +185,6 @@ async def run_qwen_agent():
                                             'name': name, 
                                             'arguments': json.dumps(safe_args)
                                         })()
-                                
                                 msg.tool_calls = [
                                     FakeToolCall(c['name'], c.get('parameters', c.get('arguments', {})), i) 
                                     for i, c in enumerate(parsed_calls)
@@ -222,15 +205,14 @@ async def run_qwen_agent():
                                     print("❌ REJECTED by user.")
                             break
 
-                        # Process tool calls
                         for tool_call in msg.tool_calls:
                             name = tool_call.function.name
                             args = json.loads(tool_call.function.arguments or "{}")
-                            print(f"️  [tool] {name}({args})")
+                            print(f"🛠️  [tool] {name}({args})")
 
                             if name == 'propose_trade':
                                 _proposed = True
-                                telegram_notify.send_alert(f"📊 New trade proposal logged: {args}")
+                                telegram_notify.send_alert(f" New trade proposal logged: {args}")
 
                             try:
                                 result = await session.call_tool(name, args)
@@ -247,7 +229,7 @@ async def run_qwen_agent():
                 except KeyboardInterrupt:
                     break
                 except Exception as e:
-                    print(f" Error: {e}")
+                    print(f"❌ Error: {e}")
 
 if __name__ == "__main__":
     asyncio.run(run_qwen_agent())
