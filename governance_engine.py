@@ -426,3 +426,33 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
         "circuit_breaker": breaker,
         "new_status": TradeStatus.AWAITING_APPROVAL.value
     }
+# -----------------------------------------------------------------
+# DASHBOARD INTEGRATION HELPERS
+# -----------------------------------------------------------------
+def dashboard_approve_trade(trade_id: int, approved_by: str = "dashboard_ui") -> Dict[str, Any]:
+    """
+    Finds the active approval token for a trade and consumes it via the standard approve_trade flow.
+    Keeps the token hidden from the UI.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    # Find the most recent unused token for this trade
+    cursor.execute("SELECT token FROM approval_tokens WHERE trade_id = ? AND used_at IS NULL ORDER BY id DESC LIMIT 1", (trade_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return {"status": "ERROR", "reason": "No active approval token found for this trade."}
+    
+    return approve_trade(row[0], approved_by=approved_by)
+
+def dashboard_reject_trade(trade_id: int, reason: str = "Rejected via dashboard") -> Dict[str, Any]:
+    """Transitions a trade from AWAITING_APPROVAL to REJECTED."""
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": "Trade not found."}
+    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+        return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
+    
+    result = transition_trade(trade_id, TradeStatus.REJECTED, ActorType.HUMAN, {"reason": reason})
+    return result

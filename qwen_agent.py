@@ -1,3 +1,9 @@
+#!/usr/bin/env python3
+"""
+Robo-Shopper V4 - Agentic Finance Copilot (Qwen/Groq/OpenRouter Adapter).
+Implements the Institutional Desk UX: Agent investigates in terminal, 
+human authorizes via web dashboard.
+"""
 import asyncio
 import json
 import sys
@@ -80,7 +86,7 @@ except ImportError:
             print(f"📨 [Telegram stub] {msg}")
 
 # ------------------------------------------------------------------
-# SYSTEM PROMPT (Hardened Agentic Behavior + Zero Hallucination + Trust Boundary)
+# SYSTEM PROMPT (Institutional Desk UX + Agentic Behavior + Trust Boundary)
 # ------------------------------------------------------------------
 SYSTEM_PROMPT = """
 You are Robo-Shopper, an institutional-grade, genuinely agentic AI finance copilot. 
@@ -98,29 +104,30 @@ AVAILABLE TOOLS & EXACT PARAMETERS:
    - `get_trade_history(limit: int)`
    - `propose_trade(symbol: str, side: str, quantity: float, entry_price: float, stop_loss: float, take_profit: float (optional), reasoning: str (optional))`
    - `screen_trade(trade_id: int)`
-4. Execution: `format_onchainos_command(trade_id: int)` (Generates dry-run CLI for human. REQUIRES an APPROVED trade_id. DO NOT attempt to pass raw parameters.)
+4. Governance:
+   - `request_approval(trade_id: int)` - Moves trade to AWAITING_APPROVAL.
+5. Execution:
+   - `format_onchainos_command(trade_id: int)` - Generates dry-run CLI command for an APPROVED trade.
 
-MANDATORY AGENTIC PROTOCOL (Follow Strictly):
-1. PLAN FIRST: Always begin your response with a brief "Investigation Plan:" listing the 2-3 tools you will call and why.
-2. CONTEXT FIRST: If the user asks about portfolio fit or risk policy, your VERY FIRST tool call MUST be `get_trade_history(limit=5)` to check current exposure BEFORE calculating new position sizes.
-3. STRICT DATA CHAINING: When a tool returns a value (e.g., "position_size": 2.0), you MUST copy that exact number into the next tool call. 
-   - FORBIDDEN: 'size': 'SIZE_FROM_CALCULATE_POSITION_SIZE' or 'trade_id': 'TRADE_ID_FROM_PROPOSE_TRADE'.
-   - REQUIRED: 'size': 2.0, 'trade_id': 11981.
-4. ASSESS & SYNTHESIZE: After gathering evidence, produce a concise decision dossier. Flag any anomalies (e.g., high exposure, overbought RSI).
+MANDATORY AGENTIC PROTOCOL:
+1. PLAN FIRST: Always begin with a brief "Investigation Plan:".
+2. CONTEXT FIRST: Check `get_trade_history(limit=5)` before calculating new position sizes.
+3. STRICT DATA CHAINING: Use exact numerical values from tool outputs. NO placeholders.
+4. ASSESS & SYNTHESIZE: Produce a concise decision dossier. Flag anomalies.
 
-MANDATORY GOVERNANCE GATES (Non-Negotiable, Deterministic):
-Once you have sufficient evidence and a viable proposal, you MUST ensure it passes these gates in order:
-1. `calculate_position_size` (to get the mathematically correct size for the 2% risk cap).
-2. `evaluate_trade_risk` (to verify it passes the deterministic veto).
-3. `propose_trade` (using EXACT parameters: `symbol`, `side`, `quantity`, `entry_price`, `stop_loss`, `reasoning`. Omit `take_profit` if not provided).
-4. `screen_trade` (using the exact integer `trade_id` returned by propose_trade).
+MANDATORY GOVERNANCE GATES (Non-Negotiable):
+1. `calculate_position_size`
+2. `evaluate_trade_risk`
+3. `propose_trade` (EXACT parameters: `symbol`, `side`, `quantity`, `entry_price`, `stop_loss`, `reasoning`)
+4. `screen_trade`
+5. `request_approval` (using exact integer `trade_id`). This moves the trade to AWAITING_APPROVAL. Inform the user to approve via the Dashboard at http://localhost:8003. Do NOT ask for CLI confirmation.
+6. `format_onchainos_command` (using exact integer `trade_id`) ONLY after the user confirms they have approved via the dashboard.
 
 CRITICAL SAFETY RULES:
-- Execution commands CANNOT be created directly from proposed parameters. Execution requires an approved trade_id.
-- NEVER fabricate market data, prices, indicators, or financial information.
-- NEVER use placeholder strings. Use exact numerical values from tool outputs.
+- NEVER fabricate market data or use placeholder strings.
 - NEVER attempt to pass a portfolio_balance to risk tools. The system fetches the authoritative balance from the trusted treasury automatically.
-- NEVER execute trades autonomously. Always request explicit human approval after `screen_trade`.
+- NEVER execute trades autonomously. Human approval is a mandatory governance boundary.
+- Execution commands CANNOT be created directly from proposed parameters. Execution requires an approved trade_id.
 - If a tool fails, report: "Insufficient evidence due to tool failure: [tool name]." FAIL SAFE > FAIL SILENT.
 """
 
@@ -204,19 +211,17 @@ async def run_qwen_agent():
 
                         if not msg.tool_calls:
                             print(f"\n🤖 Robo-Shopper:\n{msg.content}\n")
-                            if msg.content and ("onchainos" in msg.content or (_proposed and not _rejected)):
+                            # Only show execution prompt if trade was approved and command generated
+                            if msg.content and ("onchainos" in msg.content and not _rejected):
                                 telegram_notify.send_alert(msg.content)
-                                ans = input("\n⚡ Execute this command? [y/N]: ").strip().lower()
-                                if ans in ("y", "yes"):
-                                    print("✅ APPROVED - copy the command above to execute.")
-                                else:
-                                    print("❌ REJECTED by user.")
+                                print("\n✅ Trade approved and execution command generated.")
+                                print("Copy the command above to execute the dry-run.")
                             break
 
                         for tool_call in msg.tool_calls:
                             name = tool_call.function.name
                             args = json.loads(tool_call.function.arguments or "{}")
-                            print(f"🛠️  [tool] {name}({args})")
+                            print(f"️  [tool] {name}({args})")
 
                             if name == 'propose_trade':
                                 _proposed = True
@@ -226,21 +231,24 @@ async def run_qwen_agent():
                                 result = await session.call_tool(name, args)
                                 res_text = "\n".join([c.text for c in result.content if hasattr(c, "text")])
                                 
+                                # Handle request_approval: Direct user to dashboard
+                                if name == 'request_approval':
+                                    res_data = json.loads(res_text) if res_text.startswith('{') else {}
+                                    if res_data.get("status") == "success":
+                                        trade_id = args.get("trade_id")
+                                        print(f"\n🔐 Trade {trade_id} is now AWAITING_APPROVAL.")
+                                        print(f"   Please review and approve via the Dashboard at http://localhost:8003")
+                                        print(f"   Once approved, ask me to 'execute trade {trade_id}'.")
+                                        res_text = json.dumps({
+                                            "status": "success",
+                                            "message": f"Trade {trade_id} awaiting dashboard approval."
+                                        }, indent=2)
+                                    else:
+                                        print(f"❌ Approval request failed: {res_data.get('reason')}")
+                                
+                                # Detect rejection from screen_trade
                                 if name == 'screen_trade' and 'REJECTED' in res_text.upper():
                                     _rejected = True
+                                    
                             except Exception as e:
-                                res_text = f"Error executing tool: {e}"
-
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call.id,
-                                "content": res_text,
-                            })
-
-                except KeyboardInterrupt:
-                    break
-                except Exception as e:
-                    print(f"❌ Error: {e}")
-
-if __name__ == "__main__":
-    asyncio.run(run_qwen_agent())
+                                res_text = f"Error executing tool: {e

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Robo-Shopper V4 - Universal MCP Tool Registry.
-Exposes ALL tools: Market Intel, Risk, Memory, Execution.
+Exposes ALL tools: Market Intel, Risk, Memory, Execution, Governance.
 Governance is enforced via explicit tool routing.
 TRUST BOUNDARY: Portfolio balance is never accepted from LLM.
 """
@@ -110,7 +110,19 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol", "side", "quantity", "entry_price", "stop_loss"]
             }
         ),
-         # ---------- EXECUTION (DRY-RUN ONLY, GATED) ----------
+        # ---------- GOVERNANCE: REQUEST APPROVAL ----------
+        types.Tool(
+            name="request_approval",
+            description="Request human approval for a screened trade. Returns an approval token that must be confirmed by the human. DO NOT call this unless the trade has passed screen_trade.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "trade_id": {"type": "integer", "description": "The ID of the trade to approve."}
+                },
+                "required": ["trade_id"]
+            }
+        ),
+        # ---------- EXECUTION (DRY-RUN ONLY, GATED) ----------
         types.Tool(
             name="format_onchainos_command",
             description="Generate a dry-run CLI command for an APPROVED trade. REQUIRES an approved trade_id. DO NOT pass raw parameters.",
@@ -176,8 +188,16 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                 take_profit=args.get("take_profit"),
                 reasoning=args.get("reasoning", "")
             )
+
+        # ---------- GOVERNANCE: REQUEST APPROVAL ----------
+        elif name == "request_approval":
+            from governance_engine import request_approval
+            result = request_approval(args.get("trade_id"))
+
+        # ---------- EXECUTION (DRY-RUN ONLY) ----------
         elif name == "format_onchainos_command":
-            result = governance_engine.generate_execution_command(args.get("trade_id"))
+            from governance_engine import generate_execution_command
+            result = generate_execution_command(args.get("trade_id"))
 
         else:
             raise ValueError(f"Unknown tool: {name}")
