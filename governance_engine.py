@@ -318,6 +318,64 @@ def execute_trade(
     return result
 
 # ------------------------------------------------------------------
+# STEP 4: EXECUTION COMMAND GENERATION (DRY-RUN ONLY)
+# ------------------------------------------------------------------
+def generate_execution_command(trade_id: int) -> Dict[str, Any]:
+    """
+    Generates a dry-run CLI command ONLY for an APPROVED trade.
+    Enforces strict state and proposal integrity checks.
+    """
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
+    
+    # 1. REQUIRE APPROVED STATE
+    if trade["status"] != TradeStatus.APPROVED.value:
+        return {
+            "status": "REJECTED", 
+            "reason": f"Trade {trade_id} is '{trade['status']}'. Must be 'approved' to generate execution command."
+        }
+    
+    # 2. VERIFY PROPOSAL INTEGRITY
+    expires_at_str = trade.get("proposal_expires_at")
+    if not expires_at_str:
+        return {"status": "ERROR", "reason": "Missing proposal expiration."}
+    
+    expires_at = datetime.fromisoformat(expires_at_str)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    
+    proposal = TradeProposal(
+        asset=trade["symbol"],
+        side=trade["side"],
+        entry_price=trade["entry_price"],
+        stop_loss=trade["stop_loss"],
+        take_profit=trade.get("take_profit"),
+        quantity=trade["quantity"],
+        risk_percent=trade["risk_percent"],
+        risk_amount=trade["risk_amount"],
+        portfolio_balance_at_time=trade["portfolio_balance"],
+        agent_reasoning=trade.get("reasoning", ""),
+        risk_decision="PASSED",
+        expires_at=expires_at
+    )
+    computed_hash = proposal.compute_hash()
+    stored_hash = trade.get("proposal_hash")
+    
+    if not stored_hash or computed_hash != stored_hash:
+        return {"status": "REJECTED", "reason": "PROPOSAL TAMPERED: Hash mismatch."}
+    
+    # 3. USE DATABASE VALUES (DRY-RUN ONLY)
+    return {
+        "status": "SUCCESS",
+        "trade_id": trade_id,
+        "command": f"onchainos --dry-run {trade['side']} {trade['quantity']} {trade['symbol']}",
+        "symbol": trade["symbol"],
+        "side": trade["side"],
+        "quantity": trade["quantity"],
+        "message": "Copy and paste this command into your terminal to execute."
+    }
+# ------------------------------------------------------------------
 # UNIFIED SCREEN (unchanged)
 # ------------------------------------------------------------------
 def screen_trade(trade_id: int) -> Dict[str, Any]:

@@ -110,19 +110,16 @@ async def handle_list_tools() -> list[types.Tool]:
                 "required": ["symbol", "side", "quantity", "entry_price", "stop_loss"]
             }
         ),
-        # ---------- EXECUTION (DRY-RUN ONLY) ----------
+         # ---------- EXECUTION (DRY-RUN ONLY, GATED) ----------
         types.Tool(
             name="format_onchainos_command",
-            description="Generate a dry-run CLI command for the human to copy and execute. NEVER executes automatically.",
+            description="Generate a dry-run CLI command for an APPROVED trade. REQUIRES an approved trade_id. DO NOT pass raw parameters.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "symbol": {"type": "string"},
-                    "side": {"type": "string", "enum": ["buy", "sell"]},
-                    "amount": {"type": "number"},
-                    "slippage": {"type": "number", "default": 0.5}
+                    "trade_id": {"type": "integer", "description": "The ID of the APPROVED trade."}
                 },
-                "required": ["symbol", "side", "amount"]
+                "required": ["trade_id"]
             }
         ),
     ]
@@ -179,12 +176,8 @@ async def handle_call_tool(name: str, arguments: dict | None) -> list[types.Text
                 take_profit=args.get("take_profit"),
                 reasoning=args.get("reasoning", "")
             )
-
         elif name == "format_onchainos_command":
-            result = {
-                "status": "success", 
-                "command": f"onchainos {args.get('side', 'buy')} {args.get('amount', 0)} {args.get('symbol', 'BTC')}"
-            }
+            result = governance_engine.generate_execution_command(args.get("trade_id"))
 
         else:
             raise ValueError(f"Unknown tool: {name}")
