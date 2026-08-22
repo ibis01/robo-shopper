@@ -13,6 +13,7 @@ from typing import Dict, Any, Optional, Tuple
 
 from config import DB_PATH
 from schemas import TradeStatus, ActorType, TradeProposal
+from state_machine import transition_trade
 import trade_memory_mcp
 import risk_management_mcp
 import guardrails_mcp
@@ -25,7 +26,6 @@ def _ensure_schema():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
     
-    # CRITICAL FIX: Enable WAL mode to prevent "database is locked" errors
     cursor.execute("PRAGMA journal_mode=WAL;")
     
     cursor.execute("""
@@ -43,7 +43,6 @@ def _ensure_schema():
         )
     """)
     
-    # Safe migrations for existing DBs
     try:
         cursor.execute("ALTER TABLE approval_tokens ADD COLUMN token TEXT")
     except sqlite3.OperationalError:
@@ -59,6 +58,48 @@ def _ensure_schema():
 _ensure_schema()
 
 # ------------------------------------------------------------------
+# SHARED HELPER: Compute proposal hash EXACTLY from stored DB values
+# ------------------------------------------------------------------
+def _get_proposal_hash(trade: Dict[str, Any]) -> str:
+    """
+    Computes the proposal hash using EXACT stored database values.
+    No fallback logic – any missing field raises KeyError.
+    This guarantees perfect consistency with the original hash.
+    """
+    entry = float(trade["entry_price"])
+    stop = float(trade["stop_loss"])
+    qty = float(trade["quantity"])
+    balance = float(trade["portfolio_balance"])
+
+    # Use stored risk metrics directly – no recomputation!
+    risk_amount = float(trade["risk_amount"])
+    risk_percent = float(trade["risk_percent"])
+
+    expires_at_str = trade["proposal_expires_at"]
+    expires_at = datetime.fromisoformat(expires_at_str)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+
+    take_profit = trade.get("take_profit")
+    agent_reasoning = trade.get("reasoning") or ""
+
+    proposal = TradeProposal(
+        asset=str(trade["symbol"]),
+        side=str(trade["side"]),
+        entry_price=entry,
+        stop_loss=stop,
+        take_profit=take_profit,
+        quantity=qty,
+        risk_percent=risk_percent,
+        risk_amount=risk_amount,
+        portfolio_balance_at_time=balance,
+        agent_reasoning=agent_reasoning,
+        risk_decision="PENDING",
+        expires_at=expires_at
+    )
+    return proposal.compute_hash()
+
+# ------------------------------------------------------------------
 # TOKEN MANAGEMENT
 # ------------------------------------------------------------------
 def _create_approval_token(trade_id: int, proposal_hash: str, policy_version: str, requested_by: str, conn: sqlite3.Connection) -> Dict[str, Any]:
@@ -67,7 +108,6 @@ def _create_approval_token(trade_id: int, proposal_hash: str, policy_version: st
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
     
-    # CRITICAL FIX: Store proposal_hash in the token record for tamper detection
     conn.execute(
         "INSERT INTO approval_tokens (trade_id, token, token_hash, proposal_hash, policy_version, requested_by, expires_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         (trade_id, token, token_hash, proposal_hash, policy_version, requested_by, expires_at.isoformat(), datetime.now(timezone.utc).isoformat())
@@ -77,7 +117,6 @@ def _create_approval_token(trade_id: int, proposal_hash: str, policy_version: st
 def _validate_and_consume_token_in_transaction(conn: sqlite3.Connection, approval_token: str) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
     """Validates token, checks expiry/replay, and marks as used."""
     token_hash = hashlib.sha256(approval_token.encode()).hexdigest()
-    # CRITICAL FIX: Select proposal_hash from the token record
     cursor = conn.execute(
         "SELECT id, trade_id, token_hash, proposal_hash, policy_version, expires_at, used_at FROM approval_tokens WHERE token_hash = ?",
         (token_hash,)
@@ -93,7 +132,6 @@ def _validate_and_consume_token_in_transaction(conn: sqlite3.Connection, approva
     if datetime.now(timezone.utc) > expires_at: return None, None, None, None
         
     conn.execute("UPDATE approval_tokens SET used_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), token_id))
-    # Return trade_id, token_hash, token_proposal_hash, policy_version
     return trade_id, token_hash, token_proposal_hash, policy_version
 
 # ------------------------------------------------------------------
@@ -145,40 +183,24 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
     if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
         return {"status": "REJECTED", "reason": f"Trade is {trade['status']}. Must call screen_trade() first."}
 
+    if not trade.get("proposal_expires_at"):
+        return {"status": "REJECTED", "reason": "No expiration set."}
+    
+    # Use shared helper for consistent hash computation
+    proposal_hash = _get_proposal_hash(trade)
+    policy_version = "1.0.0"
+
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     try:
         conn.execute("BEGIN EXCLUSIVE")
-        row = conn.execute("SELECT * FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        row = conn.execute("SELECT id FROM trades WHERE id = ?", (trade_id,)).fetchone()
         if not row:
             conn.rollback(); return {"status": "ERROR", "reason": "Trade not found in DB."}
         
-        cols = [c[0] for c in conn.execute("SELECT * FROM trades LIMIT 1").description]
-        trade_data = dict(zip(cols, row))
-        
-        entry = trade_data["entry_price"]; stop = trade_data["stop_loss"]; qty = trade_data["quantity"]
-        balance = trade_data.get("portfolio_balance") or 10000.0
-        risk_amount = trade_data.get("risk_amount") or abs(entry - stop) * qty
-        risk_percent = trade_data.get("risk_percent") or (risk_amount / balance if balance > 0 else 0.02)
-        
-        expires_at_str = trade_data.get("proposal_expires_at")
-        if not expires_at_str:
-            conn.rollback(); return {"status": "REJECTED", "reason": "No expiration set."}
-
-        proposal = TradeProposal(
-            asset=trade_data["symbol"], side=trade_data["side"], entry_price=entry, stop_loss=stop,
-            take_profit=trade_data.get("take_profit"), quantity=qty, risk_percent=risk_percent,
-            risk_amount=risk_amount, portfolio_balance_at_time=balance,
-            agent_reasoning=trade_data.get("reasoning", ""), risk_decision="PENDING",
-            expires_at=datetime.fromisoformat(expires_at_str),
-        )
-        proposal_hash = proposal.compute_hash()
-        policy_version = proposal.policy_version
-
         conn.execute("UPDATE trades SET proposal_hash = ?, policy_version = ? WHERE id = ?",
                      (proposal_hash, policy_version, trade_id))
         
-        # Pass proposal_hash to token creation
         token_result = _create_approval_token(trade_id, proposal_hash, policy_version, requested_by, conn)
         conn.commit()
         
@@ -205,27 +227,29 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
     try:
         conn.execute("BEGIN EXCLUSIVE")
         
-        # CRITICAL FIX: Unpack 4 values including token_proposal_hash
         trade_id, token_hash, token_proposal_hash, token_policy = _validate_and_consume_token_in_transaction(conn, approval_token)
         if trade_id is None:
             conn.rollback()
             return {"status": "REJECTED", "reason": "Invalid, expired, or used token."}
         
-        row = conn.execute("SELECT id, status, proposal_hash FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        row = conn.execute("SELECT id, status, proposal_hash, policy_version FROM trades WHERE id = ?", (trade_id,)).fetchone()
         if not row:
             conn.rollback()
             return {"status": "REJECTED", "reason": "Trade not found."}
         
-        tid, status, trade_proposal_hash = row
+        tid, status, trade_proposal_hash, trade_policy_version = row
         
         if status != "awaiting_approval":
             conn.rollback()
             return {"status": "REJECTED", "reason": f"Trade is {status}."}
         
-        # CRITICAL FIX: Compare trade's proposal_hash with token's proposal_hash
         if trade_proposal_hash != token_proposal_hash:
             conn.rollback()
             return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: trade modified after token minted."}
+        
+        if trade_policy_version != token_policy:
+            conn.rollback()
+            return {"status": "REJECTED", "reason": "POLICY MISMATCH: trade policy version changed after token minted."}
         
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("UPDATE trades SET status = 'approved', updated_at = ? WHERE id = ?", (now, trade_id))
@@ -241,7 +265,32 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         conn.close()
 
 # ------------------------------------------------------------------
-# 4. DASHBOARD GOVERNANCE BRIDGE (P0 SECURE INTEGRATION)
+# 4. EXECUTE TRADE (With Hash Verification)
+# ------------------------------------------------------------------
+def execute_trade(trade_id: int, execution_price: float, executed_by: str = "execution_gateway") -> Dict[str, Any]:
+    """Transitions an APPROVED trade to EXECUTED with hash verification."""
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
+    if trade["status"] == TradeStatus.EXECUTED.value:
+        return {"status": "SUCCESS", "new_status": TradeStatus.EXECUTED.value, "idempotent": True}
+    if trade["status"] != TradeStatus.APPROVED.value:
+        return {"status": "REJECTED", "reason": f"Trade {trade_id} is '{trade['status']}', must be 'approved'."}
+    
+    stored_hash = trade.get("proposal_hash")
+    if not stored_hash:
+        return {"status": "REJECTED", "reason": "No proposal hash."}
+    
+    # Use shared helper for consistent hash computation
+    computed_hash = _get_proposal_hash(trade)
+    
+    if computed_hash != stored_hash:
+        return {"status": "REJECTED", "reason": "PROPOSAL TAMPERED: Hash mismatch."}
+    
+    return transition_trade(trade_id, TradeStatus.EXECUTED, ActorType.EXECUTION_GATEWAY, {"execution_price": execution_price, "executed_by": executed_by})
+
+# ------------------------------------------------------------------
+# 5. DASHBOARD GOVERNANCE BRIDGE
 # ------------------------------------------------------------------
 def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
     """
@@ -249,6 +298,12 @@ def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
     to the existing cryptographic approve_trade() primitive.
     The browser NEVER sees the token.
     """
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": "Trade not found."}
+    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+        return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
+    
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     try:
@@ -262,10 +317,10 @@ def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
         if not row:
             return {"status": "ERROR", "reason": "No active approval token found."}
         
-        # Close read connection before calling approve_trade to avoid lock contention
+        token = row[0]
         conn.close()
         
-        return approve_trade(row[0], approved_by="human_dashboard")
+        return approve_trade(token, approved_by="human_dashboard")
     except Exception as e:
         try: conn.close()
         except: pass
@@ -273,38 +328,40 @@ def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
 
 def dashboard_reject_trade(trade_id: int) -> Dict[str, Any]:
     """
-    Server-side bridge: uses the canonical state machine to reject the trade.
-    Does not delete the trade or bypass governance.
+    Server-side bridge: uses the CANONICAL state machine to reject the trade.
     """
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    try:
-        row = conn.execute("SELECT status FROM trades WHERE id = ?", (trade_id,)).fetchone()
-        if not row:
-            return {"status": "ERROR", "reason": "Trade not found."}
-        if row[0] != "awaiting_approval":
-            return {"status": "ERROR", "reason": f"Trade is {row[0]}."}
-        
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ?", (now, trade_id))
-        conn.commit()
-        return {"status": "SUCCESS", "message": "Trade rejected."}
-    except Exception as e:
-        try: conn.rollback()
-        except: pass
-        return {"status": "ERROR", "reason": str(e)}
-    finally:
-        conn.close()
+    trade = trade_memory_mcp.get_trade(trade_id)
+    if not trade:
+        return {"status": "ERROR", "reason": "Trade not found."}
+    if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
+        return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
+    
+    return transition_trade(
+        trade_id, 
+        TradeStatus.REJECTED, 
+        ActorType.HUMAN, 
+        {"reason": "Rejected via dashboard"}
+    )
 
 # ------------------------------------------------------------------
-# 5. EXECUTION GATEWAY (Dry-Run Command Generation)
+# 6. EXECUTION GATEWAY (Dry-Run Command Generation)
 # ------------------------------------------------------------------
 def generate_execution_command(trade_id: int) -> Dict[str, Any]:
-    """Generates a dry-run CLI command ONLY for an APPROVED trade."""
+    """Generates a dry-run CLI command ONLY for an APPROVED trade (not yet executed)."""
     trade = trade_memory_mcp.get_trade(trade_id)
-    if not trade: return {"status": "ERROR", "reason": "Trade not found."}
+    if not trade:
+        return {"status": "ERROR", "reason": "Trade not found."}
+    if trade["status"] == TradeStatus.EXECUTED.value:
+        return {"status": "REJECTED", "reason": "Trade already executed."}
     if trade["status"] != TradeStatus.APPROVED.value:
-        return {"status": "REJECTED", "reason": f"Trade is {trade['status']}. Must be approved."}
+        return {"status": "REJECTED", "reason": f"Trade is {trade['status']}. Must be 'approved'."}
+    
+    # Use shared helper for consistent hash verification
+    computed_hash = _get_proposal_hash(trade)
+    stored_hash = trade.get("proposal_hash")
+    
+    if not stored_hash or computed_hash != stored_hash:
+        return {"status": "REJECTED", "reason": "PROPOSAL TAMPERED: Hash mismatch."}
     
     return {
         "status": "SUCCESS", "trade_id": trade_id,
