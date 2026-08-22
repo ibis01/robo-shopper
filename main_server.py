@@ -113,11 +113,11 @@ async def handle_list_tools() -> list[types.Tool]:
         # ---------- GOVERNANCE: REQUEST APPROVAL ----------
         types.Tool(
             name="request_approval",
-            description="Request human approval for a screened trade. Returns an approval token that must be confirmed by the human. DO NOT call this unless the trade has passed screen_trade.",
+            description="Creates a server-side one-time authorization token for the human dashboard approval flow. The token is stored and used internally; the human does not receive or enter the token manually. This moves the trade to AWAITING_APPROVAL and makes it visible on the dashboard. Idempotent: reuses existing active token if present.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "trade_id": {"type": "integer", "description": "The ID of the trade to approve."}
+                    "trade_id": {"type": "integer", "description": "The ID of the screened trade to authorize."}
                 },
                 "required": ["trade_id"]
             }

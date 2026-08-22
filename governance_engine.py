@@ -174,10 +174,11 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
     return {"status": "SUCCESS", "message": "Passed all gates."}
 
 # ------------------------------------------------------------------
-# 2. REQUEST APPROVAL (Mints Token)
+# 2. REQUEST APPROVAL (Idempotent – reuses existing active token)
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Mints a one-time approval token for an already screened trade."""
+    """Mints a one-time approval token for an already screened trade.
+    Idempotent: if an active token exists, reuses it."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade: return {"status": "ERROR", "reason": "Trade not found."}
     if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
@@ -186,12 +187,33 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
     if not trade.get("proposal_expires_at"):
         return {"status": "REJECTED", "reason": "No expiration set."}
     
+    # --- IDEMPOTENCY: check for existing active token ---
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    cursor = conn.cursor()
+    cursor.execute(
+        "SELECT token, expires_at, proposal_hash, policy_version FROM approval_tokens WHERE trade_id = ? AND used_at IS NULL AND expires_at > ?",
+        (trade_id, datetime.now(timezone.utc).isoformat())
+    )
+    existing = cursor.fetchone()
+    if existing:
+        token, expires_at, stored_hash, stored_policy = existing
+        conn.close()
+        return {
+            "status": "success",
+            "trade_id": trade_id,
+            "approval_token": token,
+            "expires_at": expires_at,
+            "proposal_hash": stored_hash,
+            "policy_version": stored_policy,
+            "message": "Existing active token reused."
+        }
+    # --- End idempotency check ---
+
     # Use shared helper for consistent hash computation
     proposal_hash = _get_proposal_hash(trade)
     policy_version = "1.0.0"
 
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
     try:
         conn.execute("BEGIN EXCLUSIVE")
         row = conn.execute("SELECT id FROM trades WHERE id = ?", (trade_id,)).fetchone()
