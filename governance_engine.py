@@ -63,7 +63,7 @@ _ensure_schema()
 def _get_proposal_hash(trade: Dict[str, Any]) -> str:
     """
     Computes the proposal hash using EXACT stored database values.
-    No fallback logic – any missing field raises KeyError.
+    No fallback – any missing field raises KeyError.
     This guarantees perfect consistency with the original hash.
     """
     entry = float(trade["entry_price"])
@@ -303,11 +303,16 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
     if not stored_hash:
         return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    # Use shared helper for consistent hash computation
+    # Recompute hash using stored values
     computed_hash = _get_proposal_hash(trade)
     
     if computed_hash != stored_hash:
-        return {"status": "REJECTED", "reason": "PROPOSAL TAMPERED: Hash mismatch."}
+        return {
+            "status": "REJECTED",
+            "reason": f"PROPOSAL TAMPERED: Hash mismatch. Stored: {stored_hash[:12]}... Computed: {computed_hash[:12]}...",
+            "stored_hash": stored_hash,
+            "computed_hash": computed_hash
+        }
     
     return transition_trade(trade_id, TradeStatus.EXECUTED, ActorType.EXECUTION_GATEWAY, {"execution_price": execution_price, "executed_by": executed_by})
 
