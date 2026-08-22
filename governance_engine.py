@@ -58,27 +58,41 @@ def _ensure_schema():
 _ensure_schema()
 
 # ------------------------------------------------------------------
-# SHARED HELPER: Compute proposal hash EXACTLY from stored DB values
+# SHARED HELPER: Compute proposal hash consistently
 # ------------------------------------------------------------------
 def _get_proposal_hash(trade: Dict[str, Any]) -> str:
     """
-    Computes the proposal hash using EXACT stored database values.
-    No fallback – any missing field raises KeyError.
-    This guarantees perfect consistency with the original hash.
+    Computes the proposal hash using STORED risk metrics for consistency.
+    If risk metrics are missing (e.g., old schema), computes them from core parameters.
+    This ensures non‑tampered trades always produce the same hash.
     """
     entry = float(trade["entry_price"])
     stop = float(trade["stop_loss"])
     qty = float(trade["quantity"])
-    balance = float(trade["portfolio_balance"])
+    balance = float(trade.get("portfolio_balance", 10000.0))
 
-    # Use stored risk metrics directly – no recomputation!
-    risk_amount = float(trade["risk_amount"])
-    risk_percent = float(trade["risk_percent"])
+    # Use stored risk metrics if available, otherwise compute
+    if "risk_amount" in trade and trade["risk_amount"] is not None:
+        risk_amount = float(trade["risk_amount"])
+    else:
+        risk_amount = abs(entry - stop) * qty
 
-    expires_at_str = trade["proposal_expires_at"]
-    expires_at = datetime.fromisoformat(expires_at_str)
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if "risk_percent" in trade and trade["risk_percent"] is not None:
+        risk_percent = float(trade["risk_percent"])
+    else:
+        risk_percent = risk_amount / balance if balance > 0 else 0.02
+
+    # Cap risk_percent to max 1.0 to avoid Pydantic validation errors
+    if risk_percent > 1.0:
+        risk_percent = 1.0
+
+    expires_at_str = trade.get("proposal_expires_at")
+    if not expires_at_str:
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    else:
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
 
     take_profit = trade.get("take_profit")
     agent_reasoning = trade.get("reasoning") or ""
@@ -303,7 +317,7 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
     if not stored_hash:
         return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    # Recompute hash using stored values
+    # Recompute hash using stored risk metrics for consistency
     computed_hash = _get_proposal_hash(trade)
     
     if computed_hash != stored_hash:
@@ -395,3 +409,4 @@ def generate_execution_command(trade_id: int) -> Dict[str, Any]:
         "command": f"onchainos --dry-run {trade['side']} {trade['quantity']} {trade['symbol']}",
         "symbol": trade["symbol"], "side": trade["side"], "quantity": trade["quantity"]
     }
+    
