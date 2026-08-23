@@ -22,7 +22,6 @@ def _ensure_schema():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
-    # 🔒 Store both token and token_hash – token for retrieval, hash for validation
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS approval_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -46,11 +45,6 @@ _ensure_schema()
 # SHARED HELPER: Compute hash from core parameters (deterministic)
 # ------------------------------------------------------------------
 def _get_proposal_hash(trade: Dict[str, Any]) -> str:
-    """
-    Computes the proposal hash from immutable core parameters.
-    Uses the same rounding logic as propose_trade to guarantee consistency.
-    FAILS CLOSED: raises KeyError if portfolio_balance is missing.
-    """
     entry = float(trade["entry_price"])
     stop = float(trade["stop_loss"])
     qty = float(trade["quantity"])
@@ -64,13 +58,11 @@ def _get_proposal_hash(trade: Dict[str, Any]) -> str:
         risk_percent = 1.0
         risk_amount = risk_percent * balance
 
-    expires_at_str = trade.get("proposal_expires_at")
-    if not expires_at_str:
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
-    else:
-        expires_at = datetime.fromisoformat(expires_at_str)
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
+    # 🔒 FAIL CLOSED: proposal_expires_at must exist
+    expires_at_str = trade["proposal_expires_at"]
+    expires_at = datetime.fromisoformat(expires_at_str)
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
 
     take_profit = trade.get("take_profit")
     agent_reasoning = trade.get("reasoning") or ""
@@ -125,7 +117,7 @@ def _validate_and_consume_token_in_transaction(conn: sqlite3.Connection, approva
     return trade_id, token_hash, token_proposal_hash, policy_version
 
 # ------------------------------------------------------------------
-# 1. SCREENING
+# 1. SCREENING (two-step transition to enforce state machine)
 # ------------------------------------------------------------------
 def screen_trade(trade_id: int) -> Dict[str, Any]:
     trade = trade_memory_mcp.get_trade(trade_id)
@@ -134,34 +126,51 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
     if trade["status"] != TradeStatus.PROPOSED.value:
         return {"status": "ERROR", "reason": f"Trade is {trade['status']}."}
     
+    # Check risk
     risk_result = risk_management_mcp.evaluate_trade_risk(
         symbol=trade["symbol"], side=trade["side"],
         entry=trade["entry_price"], stop=trade["stop_loss"],
         size=trade["quantity"]
     )
     if risk_result["status"] == "REJECTED":
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), trade_id))
-        conn.commit()
-        conn.close()
-        return {"status": "REJECTED", "reason": risk_result["reason"]}
+        # Transition the trade to REJECTED state (for audit trail)
+        transition_trade(
+            trade_id,
+            TradeStatus.REJECTED,
+            ActorType.RISK_ENGINE,
+            {"risk_result": risk_result}
+        )
+        # Return REJECTED status to the caller (so tests can assert it)
+        return {"status": "REJECTED", "reason": risk_result["reason"], "details": risk_result}
     
+    # Check exposure
     exposure = guardrails_mcp.check_exposure_limit(trade["quantity"], trade["entry_price"])
     if exposure["status"] == "REJECTED":
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("UPDATE trades SET status = 'rejected', updated_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), trade_id))
-        conn.commit()
-        conn.close()
-        return {"status": "REJECTED", "reason": exposure["reason"]}
+        transition_trade(
+            trade_id,
+            TradeStatus.REJECTED,
+            ActorType.GUARDRAIL,
+            {"exposure_result": exposure}
+        )
+        return {"status": "REJECTED", "reason": exposure["reason"], "details": exposure}
     
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("UPDATE trades SET status = 'awaiting_approval', updated_at = ? WHERE id = ?", (datetime.now(timezone.utc).isoformat(), trade_id))
-    conn.commit()
-    conn.close()
-    return {"status": "SUCCESS", "message": "Passed all gates."}
+    # Pass: PROPOSED → RISK_CHECKED → AWAITING_APPROVAL
+    result1 = transition_trade(
+        trade_id,
+        TradeStatus.RISK_CHECKED,
+        ActorType.RISK_ENGINE,
+        {"message": "Risk checks passed"}
+    )
+    if result1["status"] != "SUCCESS":
+        return result1
+    
+    result2 = transition_trade(
+        trade_id,
+        TradeStatus.AWAITING_APPROVAL,
+        ActorType.RISK_ENGINE,
+        {"message": "Awaiting human approval"}
+    )
+    return result2
 
 # ------------------------------------------------------------------
 # 2. REQUEST APPROVAL (Idempotent)
@@ -280,8 +289,18 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
             conn.rollback()
             return {"status": "REJECTED", "reason": "POLICY MISMATCH: trade policy version changed after token minted."}
         
-        now = datetime.now(timezone.utc).isoformat()
-        conn.execute("UPDATE trades SET status = 'approved', updated_at = ? WHERE id = ?", (now, trade_id))
+        # Use transition_trade to log audit event
+        result = transition_trade(
+            trade_id,
+            TradeStatus.APPROVED,
+            ActorType.HUMAN,
+            {"approved_by": approved_by, "proposal_hash": token_proposal_hash},
+            conn=conn  # pass the connection to stay in transaction
+        )
+        if result["status"] != "SUCCESS":
+            conn.rollback()
+            return result
+        
         conn.commit()
         return {"status": "SUCCESS", "trade_id": trade_id, "new_status": "approved"}
         
@@ -295,7 +314,7 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         conn.close()
 
 # ------------------------------------------------------------------
-# 4. EXECUTE TRADE (with idempotency)
+# 4. EXECUTE TRADE (with idempotency, uses transition_trade)
 # ------------------------------------------------------------------
 def execute_trade(trade_id: int, execution_price: float, executed_by: str = "execution_gateway") -> Dict[str, Any]:
     trade = trade_memory_mcp.get_trade(trade_id)
@@ -366,7 +385,13 @@ def dashboard_reject_trade(trade_id: int) -> Dict[str, Any]:
         return {"status": "ERROR", "reason": "Trade not found."}
     if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
         return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
-    return transition_trade(trade_id, TradeStatus.REJECTED, ActorType.HUMAN, {"reason": "Rejected via dashboard"})
+    # Use transition_trade to log audit event
+    return transition_trade(
+        trade_id,
+        TradeStatus.REJECTED,
+        ActorType.HUMAN,
+        {"reason": "Rejected via dashboard"}
+    )
 
 # ------------------------------------------------------------------
 # 6. EXECUTION GATEWAY
