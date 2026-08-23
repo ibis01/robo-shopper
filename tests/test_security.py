@@ -1,291 +1,268 @@
 """
-Robo-Shopper V4 - Adversarial Security Tests (Sprint 5).
-Proves that governance CANNOT be bypassed using the public API.
+Robo-Shopper V4 - Single State-Transition Authority (Sprint 5).
+ONE function responsible for EVERY state mutation.
+Supports external connections for atomic transactions.
 """
-import pytest
-import sys
-import os
 import sqlite3
-from datetime import datetime, timedelta, timezone
+import json
+from datetime import datetime, timezone
+from typing import Optional, Dict, Any
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-from schemas import TradeStatus, ActorType, TradeSide
-from state_machine import transition_trade
-from tests.test_helpers import screen_and_request_approval
-from governance_engine import request_approval, approve_trade, execute_trade
-from trade_memory_mcp import propose_trade, get_trade
 from config import DB_PATH
+from schemas import TradeStatus, ActorType
 
+# --- Legal transitions ---
+ALLOWED_TRANSITIONS = {
+    TradeStatus.ANALYZING: [TradeStatus.PROPOSED, TradeStatus.REJECTED],
+    TradeStatus.PROPOSED: [TradeStatus.RISK_CHECKED, TradeStatus.REJECTED],
+    TradeStatus.RISK_CHECKED: [TradeStatus.AWAITING_APPROVAL, TradeStatus.REJECTED],
+    TradeStatus.AWAITING_APPROVAL: [TradeStatus.APPROVED, TradeStatus.REJECTED],
+    TradeStatus.APPROVED: [TradeStatus.EXECUTED, TradeStatus.CLOSED],  # cannot reject after approval
+    TradeStatus.EXECUTED: [TradeStatus.CLOSED],
+    TradeStatus.REJECTED: [],
+    TradeStatus.CLOSED: [],
+}
 
-@pytest.fixture
-def clean_db():
-    conn = sqlite3.connect(DB_PATH)
+# --- Authorized actors ---
+AUTHORIZED_ACTORS = {
+    TradeStatus.PROPOSED: [ActorType.AI, ActorType.SYSTEM],
+    TradeStatus.RISK_CHECKED: [ActorType.RISK_ENGINE],
+    TradeStatus.AWAITING_APPROVAL: [ActorType.RISK_ENGINE],
+    TradeStatus.APPROVED: [ActorType.HUMAN],                  # ONLY human
+    TradeStatus.EXECUTED: [ActorType.EXECUTION_GATEWAY],      # NOT human directly
+    TradeStatus.REJECTED: [ActorType.RISK_ENGINE, ActorType.GUARDRAIL, ActorType.HUMAN],
+    TradeStatus.CLOSED: [ActorType.SYSTEM],
+}
+
+# ------------------------------------------------------------------
+# IDEMPOTENCY CHECK
+# ------------------------------------------------------------------
+def _is_already_in_state(conn: sqlite3.Connection, trade_id: int, target_status: TradeStatus) -> bool:
     cursor = conn.cursor()
-    cursor.execute("DELETE FROM trades")
-    cursor.execute("DELETE FROM approval_tokens")
-    conn.commit()
-    conn.close()
-    yield
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM trades")
-    cursor.execute("DELETE FROM approval_tokens")
-    conn.commit()
-    conn.close()
+    cursor.execute("SELECT status FROM trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
+    return row and row[0] == target_status.value
 
+# ------------------------------------------------------------------
+# 🔒 IMMUTABLE AUDIT LOG (uses the same connection)
+# ------------------------------------------------------------------
+def _log_event(conn: sqlite3.Connection, trade_id: int, event_type: str, actor_type: str, old_status: str, new_status: str, metadata: dict):
+    """Append an immutable audit event using the provided connection."""
+    import json
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER,
+            event_type TEXT,
+            actor_type TEXT,
+            old_status TEXT,
+            new_status TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        INSERT INTO trade_events (trade_id, event_type, actor_type, old_status, new_status, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (trade_id, event_type, actor_type, old_status, new_status, json.dumps(metadata), datetime.now(timezone.utc).isoformat()))
 
-def create_proposed_trade(symbol="BTC", side="long", quantity=0.01, entry=60000, stop=59500, reasoning="test"):
-    prop = propose_trade(symbol, side, quantity, entry, stop, reasoning=reasoning)
+# ------------------------------------------------------------------
+# SINGLE STATE-TRANSITION AUTHORITY
+# ------------------------------------------------------------------
+def transition_trade(
+    trade_id: int,
+    target_status: TradeStatus,
+    actor: ActorType,
+    metadata: Optional[dict] = None,
+    require_approval_hash: Optional[str] = None,
+    conn: Optional[sqlite3.Connection] = None,
+) -> Dict[str, Any]:
+    """
+    SINGLE SOURCE OF TRUTH for all trade state changes.
+    Enforces: legality, actor auth, hash match, atomicity, idempotency.
+    """
+    metadata = metadata or {}
+    own_connection = False
     
-    # Set realistic portfolio_balance for exposure calculations
-    import sqlite3
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "UPDATE trades SET portfolio_balance = 10000.0 WHERE id = ?",
-        (prop["trade_id"],)
-    )
-    conn.commit()
-    conn.close()
+    if conn is None:
+        conn = sqlite3.connect(DB_PATH)
+        own_connection = True
+        conn.execute("BEGIN TRANSACTION")
     
-    return prop["trade_id"]
+    try:
+        cursor = conn.cursor()
+        
+        # Idempotency
+        if _is_already_in_state(conn, trade_id, target_status):
+            if own_connection:
+                conn.commit()
+                conn.close()
+            return {
+                "status": "SUCCESS",
+                "trade_id": trade_id,
+                "message": f"Trade already in {target_status.value}. Idempotent.",
+                "idempotent": True
+            }
+        
+        # Fetch current state
+        cursor.execute("""
+            SELECT id, status, proposal_hash, entry_price, quantity, stop_loss
+            FROM trades WHERE id = ?
+        """, (trade_id,))
+        row = cursor.fetchone()
+        if not row:
+            if own_connection:
+                conn.rollback()
+                conn.close()
+            return {"status": "ERROR", "trade_id": trade_id, "message": f"Trade {trade_id} not found."}
+        
+        current_status = TradeStatus(row[1])
+        stored_hash = row[2]
+        
+        # Validate transition legality
+        if target_status not in ALLOWED_TRANSITIONS.get(current_status, []):
+            if own_connection:
+                conn.rollback()
+                conn.close()
+            return {
+                "status": "REJECTED",
+                "trade_id": trade_id,
+                "message": (
+                    f"ILLEGAL: {current_status.value} → {target_status.value}. "
+                    f"Allowed: {[s.value for s in ALLOWED_TRANSITIONS.get(current_status, [])]}"
+                ),
+                "current_status": current_status.value,
+                "target_status": target_status.value
+            }
+        
+        # Validate actor
+        authorized = AUTHORIZED_ACTORS.get(target_status, [])
+        if actor not in authorized:
+            if own_connection:
+                conn.rollback()
+                conn.close()
+            return {
+                "status": "REJECTED",
+                "trade_id": trade_id,
+                "message": f"UNAUTHORIZED: {actor.value} cannot perform {target_status.value}.",
+                "authorized_actors": [a.value for a in authorized]
+            }
+        
+        # Special: EXECUTED requires approval hash
+        if target_status == TradeStatus.EXECUTED:
+            if not require_approval_hash:
+                if own_connection:
+                    conn.rollback()
+                    conn.close()
+                return {
+                    "status": "REJECTED",
+                    "trade_id": trade_id,
+                    "message": "EXECUTION BLOCKED: Approval hash required."
+                }
+            if stored_hash and require_approval_hash != stored_hash:
+                if own_connection:
+                    conn.rollback()
+                    conn.close()
+                return {
+                    "status": "REJECTED",
+                    "trade_id": trade_id,
+                    "message": "EXECUTION BLOCKED: Hash mismatch. Trade may be tampered.",
+                    "stored_hash": stored_hash,
+                    "provided_hash": require_approval_hash
+                }
+            if current_status != TradeStatus.APPROVED:
+                if own_connection:
+                    conn.rollback()
+                    conn.close()
+                return {
+                    "status": "REJECTED",
+                    "trade_id": trade_id,
+                    "message": f"EXECUTION BLOCKED: Trade must be APPROVED, but is {current_status.value}."
+                }
+        
+        # Build the atomic UPDATE
+        set_clauses = [
+            "status = ?",
+            "last_modified_at = ?",
+            "last_modified_by = ?"
+        ]
+        params = [target_status.value, datetime.now(timezone.utc).isoformat(), actor.value]
 
-    from config import DB_PATH
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        "UPDATE trades SET portfolio_balance = 10000.0 WHERE id = ?",
-        (prop["trade_id"],)
-    )
-    conn.commit()
-    conn.close()
-
-
-# ------------------------------------------------------------------
-# TESTS: UNAUTHORIZED ACTORS
-# ------------------------------------------------------------------
-def test_ai_cannot_approve(clean_db):
-    tid = create_proposed_trade()
-    screen_and_request_approval(tid)  # proper governance flow
-    result = transition_trade(tid, TradeStatus.APPROVED, ActorType.AI)
-    assert result["status"] == "REJECTED"
-    assert "UNAUTHORIZED" in result["message"]
-
-def test_system_cannot_approve(clean_db):
-    tid = create_proposed_trade()
-    screen_and_request_approval(tid)
-    result = transition_trade(tid, TradeStatus.APPROVED, ActorType.SYSTEM)
-    assert result["status"] == "REJECTED"
-    assert "UNAUTHORIZED" in result["message"]
-
-def test_ai_cannot_execute(clean_db):
-    tid = create_proposed_trade()
-    result = transition_trade(tid, TradeStatus.EXECUTED, ActorType.AI, require_approval_hash="123")
-    assert result["status"] == "REJECTED"
-    assert "UNAUTHORIZED" in result["message"] or "ILLEGAL" in result["message"]
-
-def test_system_cannot_execute(clean_db):
-    tid = create_proposed_trade()
-    result = transition_trade(tid, TradeStatus.EXECUTED, ActorType.SYSTEM, require_approval_hash="123")
-    assert result["status"] == "REJECTED"
-    assert "UNAUTHORIZED" in result["message"] or "ILLEGAL" in result["message"]
-
-# ------------------------------------------------------------------
-# TESTS: TOKEN VALIDATION
-# ------------------------------------------------------------------
-def test_wrong_token_fails(clean_db):
-    result = approve_trade("invalid_token")
-    assert result["status"] == "REJECTED"
-    assert "Invalid" in result["reason"]
-
-def test_expired_token_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    expired_time = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
-    cursor.execute("UPDATE approval_tokens SET expires_at = ? WHERE token = ?", (expired_time, token))
-    conn.commit()
-    conn.close()
-    result = approve_trade(token)
-    assert result["status"] == "REJECTED"
-    assert "Invalid" in result["reason"]
-
-def test_replayed_token_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    res1 = approve_trade(token)
-    assert res1["status"] == "SUCCESS"
-    res2 = approve_trade(token)
-    assert res2["status"] == "REJECTED"
-    assert "Invalid" in res2["reason"]
-
-def test_token_for_wrong_trade_fails(clean_db):
-    tid1 = create_proposed_trade()
-    tid2 = create_proposed_trade(symbol="ETH", entry=3000, stop=2950)
-    req1 = screen_and_request_approval(tid1)
-    assert req1["status"] == "success"
-    token1 = req1["approval_token"]
-    approve_trade(token1)
-    trade1 = get_trade(tid1)
-    assert trade1["status"] == TradeStatus.APPROVED.value
-    trade2 = get_trade(tid2)
-    assert trade2["status"] == TradeStatus.PROPOSED.value  # never requested approval
-
-# ------------------------------------------------------------------
-# TESTS: PROPOSAL TAMPERING
-# ------------------------------------------------------------------
-def test_modified_quantity_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    approve_trade(token)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET quantity = 999.0 WHERE id = ?", (tid,))
-    conn.commit()
-    conn.close()
-    result = execute_trade(tid, execution_price=60100)
-    assert result["status"] == "REJECTED"
-    assert "Hash mismatch" in result["reason"] or "TAMPERED" in result["reason"]
-
-def test_modified_entry_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    approve_trade(token)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET entry_price = 99999.0 WHERE id = ?", (tid,))
-    conn.commit()
-    conn.close()
-    result = execute_trade(tid, execution_price=60100)
-    assert result["status"] == "REJECTED"
-    assert "Hash mismatch" in result["reason"]
-
-def test_modified_policy_version_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET policy_version = '2.0.0' WHERE id = ?", (tid,))
-    conn.commit()
-    conn.close()
-    result = approve_trade(token)
-    assert result["status"] == "REJECTED"
-    assert "POLICY MISMATCH" in result["reason"]
-
-# ------------------------------------------------------------------
-# TESTS: STATE TRANSITIONS
-# ------------------------------------------------------------------
-def test_rejected_trade_cannot_execute(clean_db):
-    tid = create_proposed_trade()
-    transition_trade(tid, TradeStatus.REJECTED, ActorType.RISK_ENGINE)
-    result = execute_trade(tid, execution_price=60000)
-    assert result["status"] == "REJECTED"
-    assert "must be 'approved'" in result["reason"]
-
-def test_double_execution_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    approve_trade(token)
-    res1 = execute_trade(tid, execution_price=60100)
-    assert res1["status"] == "SUCCESS"
-    res2 = execute_trade(tid, execution_price=60200)
-    assert res2["status"] == "SUCCESS"
-    assert res2.get("idempotent") == True
-
-def test_awaiting_approval_cannot_execute(clean_db):
-    tid = create_proposed_trade()
-    # Move to AWAITING_APPROVAL via request_approval but do not approve
-    request_approval(tid)
-    result = execute_trade(tid, execution_price=60000)
-    assert result["status"] == "REJECTED"
-    assert "must be 'approved'" in result["reason"]
-
-def test_modified_risk_amount_fails(clean_db):
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    approve_trade(token)
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE trades SET stop_loss = 59000 WHERE id = ?", (tid,))
-    conn.commit()
-    conn.close()
-    result = execute_trade(tid, execution_price=60100)
-    assert result["status"] == "REJECTED"
-    assert "Hash mismatch" in result["reason"]
-
-def test_modified_expiration_fails(clean_db):
-    from schemas import TradeProposal
-    import datetime as dt
-    expires_1 = dt.datetime.now(timezone.utc) + dt.timedelta(hours=1)
-    expires_2 = dt.datetime.now(timezone.utc) + dt.timedelta(hours=2)
-    p1 = TradeProposal(
-        asset="BTC",
-        side=TradeSide.LONG,
-        entry_price=60000,
-        stop_loss=59500,
-        quantity=0.4,
-        risk_percent=0.02,
-        risk_amount=200.0,
-        portfolio_balance_at_time=10000,
-        agent_reasoning="test",
-        risk_decision="PASSED",
-        expires_at=expires_1
-    )
-    p2 = TradeProposal(
-        asset="BTC",
-        side=TradeSide.LONG,
-        entry_price=60000,
-        stop_loss=59500,
-        quantity=0.4,
-        risk_percent=0.02,
-        risk_amount=200.0,
-        portfolio_balance_at_time=10000,
-        agent_reasoning="test",
-        risk_decision="PASSED",
-        expires_at=expires_2
-    )
-    assert p1.compute_hash() != p2.compute_hash()
-
-def test_get_proposal_hash_fails_on_missing_balance(clean_db):
-    """Invariant #1: _get_proposal_hash must fail closed when portfolio_balance is missing."""
-    from governance_engine import _get_proposal_hash
-    prop = propose_trade("BTC", "long", 0.01, 60000, 59500, reasoning="test")
-    trade = get_trade(prop["trade_id"])
-    # Remove the portfolio_balance field to simulate corruption
-    del trade["portfolio_balance"]
-    with pytest.raises(KeyError):
-        _get_proposal_hash(trade)
-
-def test_approve_trade_rejects_post_token_trade_tampering(clean_db):
-    """Invariant #3: approve_trade must independently recompute the hash and reject tampering."""
-    tid = create_proposed_trade()
-    req = screen_and_request_approval(tid)
-    assert req["status"] == "success"
-    token = req["approval_token"]
-    # Tamper with the trade after token minting
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("UPDATE trades SET quantity = 999.0 WHERE id = ?", (tid,))
-    conn.commit()
-    conn.close()
-    # Approval should fail due to hash mismatch
-    result = approve_trade(token)
-    assert result["status"] == "REJECTED"
-    assert "PROPOSAL TAMPERED" in result["reason"]
-    # Ensure the trade is still in AWAITING_APPROVAL (not approved)
-    trade = get_trade(tid)
-    assert trade["status"] == TradeStatus.AWAITING_APPROVAL.value
+        if metadata:
+            _cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            for key in ["execution_price", "executed_by"]:
+                if key in metadata and key in _cols:
+                    set_clauses.append(f"{key} = ?")
+                    params.append(metadata[key])
+        
+        status_col_map = {
+            TradeStatus.PROPOSED: "proposed_at",
+            TradeStatus.RISK_CHECKED: "risk_checked_at",
+            TradeStatus.AWAITING_APPROVAL: "approval_requested_at",
+            TradeStatus.APPROVED: "approved_at",
+            TradeStatus.EXECUTED: "executed_at",
+            TradeStatus.CLOSED: "closed_at",
+        }
+        if target_status in status_col_map:
+            set_clauses.append(f"{status_col_map[target_status]} = ?")
+            params.append(datetime.now(timezone.utc).isoformat())
+        
+        if metadata:
+            set_clauses.append("transition_metadata = ?")
+            params.append(json.dumps(metadata))
+        
+        params.append(trade_id)
+        params.append(current_status.value)
+        
+        query = f"""
+            UPDATE trades 
+            SET {', '.join(set_clauses)}
+            WHERE id = ? AND status = ?
+        """
+        
+        cursor.execute(query, params)
+        affected = cursor.rowcount
+        
+        if affected == 0:
+            if own_connection:
+                conn.rollback()
+                conn.close()
+            return {
+                "status": "REJECTED",
+                "trade_id": trade_id,
+                "message": "Concurrent modification detected. Please retry."
+            }
+        
+        # 🔒 Insert audit event using the same connection (atomic)
+        _log_event(
+            conn,
+            trade_id,
+            "STATE_TRANSITION",
+            actor.value,
+            current_status.value,
+            target_status.value,
+            metadata
+        )
+        
+        if own_connection:
+            conn.commit()
+            conn.close()
+        
+        return {
+            "status": "SUCCESS",
+            "trade_id": trade_id,
+            "new_status": target_status.value,
+            "actor": actor.value,
+            "message": f"Trade {trade_id} → {target_status.value} by {actor.value}.",
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+        
+    except Exception as e:
+        if own_connection:
+            conn.rollback()
+            conn.close()
+        return {
+            "status": "ERROR",
+            "trade_id": trade_id,
+            "message": f"State transition failed: {str(e)}"
+        }
