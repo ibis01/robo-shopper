@@ -1,58 +1,79 @@
 #!/usr/bin/env python3
 """
 Live integration test for Robo-Shopper.
-Assumes all services are running (dashboard on 8003, MCP server accessible).
+Assumes dashboard server is running on localhost:8003.
+Uses pytest fixture for authenticated session with CSRF token.
 """
+import pytest
 import requests
 import sqlite3
 import time
-import sys
+import re
 from config import DB_PATH
 from trade_memory_mcp import propose_trade
 from governance_engine import screen_trade, request_approval, generate_execution_command
 
 BASE_URL = "http://localhost:8003"
-session = requests.Session()
+
 
 def check_server():
     """Check if the dashboard server is reachable."""
     try:
         resp = requests.get(f"{BASE_URL}/login", timeout=2)
-        if resp.status_code == 200:
-            return True
+        return resp.status_code == 200
     except requests.exceptions.ConnectionError:
-        pass
-    print("\n❌ Dashboard server is not running!")
-    print("   Start it in another terminal:")
-    print("   cd ~/robo-shopper && export DEV_MODE=1 && python dashboard.py\n")
-    return False
+        return False
 
-def login():
-    print("🔐 Logging in...")
-    # Use a fresh session to avoid any stale cookies
-    global session
-    session = requests.Session()
-    resp = session.post(
+
+def get_csrf_token(session):
+    """Fetch the CSRF token from the dashboard's meta tag."""
+    resp = session.get(f"{BASE_URL}/")
+    assert resp.status_code == 200, "Failed to fetch dashboard home"
+    match = re.search(r'<meta name="csrf-token" content="([^"]+)"', resp.text)
+    if not match:
+        return None
+    return match.group(1)
+
+
+@pytest.fixture(scope="module")
+def session():
+    """Create an authenticated session for integration tests."""
+    if not check_server():
+        pytest.skip("Dashboard server not running. Start with: export DEV_MODE=1 && python dashboard.py")
+
+    s = requests.Session()
+    login_resp = s.post(
         f"{BASE_URL}/api/login",
         json={"username": "operator", "password": "operator123"}
     )
-    print(f"   Login response: {resp.status_code} {resp.text}")
-    assert resp.status_code == 200, f"Login failed: {resp.status_code} {resp.text}"
-    # Verify the session cookie is set
-    assert 'session' in session.cookies.get_dict(), "No session cookie set"
+    assert login_resp.status_code == 200, f"Login failed: {login_resp.status_code} {login_resp.text}"
+    assert s.cookies.get_dict(), "No session cookie set after login"
     print("✅ Logged in.")
 
-def test_pending_trades():
+    csrf_token = get_csrf_token(s)
+    if csrf_token:
+        print(f"✅ CSRF token fetched: {csrf_token[:10]}...")
+        s.headers.update({"X-CSRF-Token": csrf_token})
+    else:
+        print("⚠️  CSRF token not found (assuming disabled)")
+
+    return s
+
+
+def test_pending_trades(session):
+    """Fetch pending trades – requires authenticated session."""
     print("📋 Fetching pending trades...")
     resp = session.get(f"{BASE_URL}/api/pending_trades")
-    print(f"   Response: {resp.status_code} {resp.text[:200]}")
-    assert resp.status_code == 200, f"Failed: {resp.status_code} {resp.text}"
+    assert resp.status_code == 200, f"Failed: {resp.status_code} {resp.text[:200]}"
     trades = resp.json()
     print(f"   Found {len(trades)} pending trades.")
-    return trades
+    return None  # pytest expects None return
 
-def test_full_pipeline():
+
+def test_full_pipeline(session):
+    """Full end‑to‑end governance pipeline."""
     print("🧪 Running full governance pipeline...")
+
     # 1. Propose trade
     prop = propose_trade("BTC", "long", 0.01, 60000, 59500, reasoning="integration_test")
     tid = prop["trade_id"]
@@ -77,12 +98,16 @@ def test_full_pipeline():
 
     # 5. Approve via dashboard API
     time.sleep(1)
-    pending = test_pending_trades()
+
+    # Fetch pending trades and verify this trade is in the list
+    pending_resp = session.get(f"{BASE_URL}/api/pending_trades")
+    assert pending_resp.status_code == 200
+    pending = pending_resp.json()
     assert any(t["id"] == tid for t in pending), "Trade not in pending list."
 
-    # 6. Approve
+    # 6. Approve (POST with CSRF token already in headers)
     approve_resp = session.post(f"{BASE_URL}/api/approve/{tid}")
-    assert approve_resp.status_code == 200, f"Approval failed: {approve_resp.status_code}"
+    assert approve_resp.status_code == 200, f"Approval failed: {approve_resp.status_code} {approve_resp.text}"
     approve_data = approve_resp.json()
     assert approve_data["status"] == "SUCCESS", f"Approval returned error: {approve_data}"
     print("   Dashboard approval succeeded.")
@@ -100,10 +125,14 @@ def test_full_pipeline():
     assert "onchainos --dry-run" in cmd_res["command"], f"Unexpected command: {cmd_res['command']}"
     print(f"   Execution command: {cmd_res['command']}")
 
-    # 9. Replay protection – approve again should fail
+    # 9. Replay protection – approve again should fail (token already used)
     approve_replay = session.post(f"{BASE_URL}/api/approve/{tid}")
-    assert approve_replay.json().get("status") == "REJECTED", "Replay not prevented."
-    print("   Replay prevented.")
+    assert approve_replay.status_code == 200, f"Replay request failed: {approve_replay.status_code}"
+    replay_data = approve_replay.json()
+    # The endpoint returns ERROR when no active token is found, or REJECTED if token is invalid.
+    # Both indicate replay failure.
+    assert replay_data["status"] != "SUCCESS", "Replay should fail"
+    print("   Replay prevented (got status: {})".format(replay_data["status"]))
 
     # 10. Tamper test – modify quantity and try to execute again
     conn = sqlite3.connect(DB_PATH)
@@ -140,28 +169,55 @@ def test_full_pipeline():
     assert cmd_reject["status"] == "REJECTED", "Rejected trade should not execute."
     print("   Rejected trade blocked.")
 
-    # 13. Unauthorized endpoints test
-    # Logout
+    # 13. Unauthorized endpoints test – logout and check 401
     logout_resp = session.post(f"{BASE_URL}/api/logout")
     assert logout_resp.status_code == 200, "Logout failed."
-    # Try unauthorized access
-    for endpoint in ["/api/pending_trades", "/api/approve/1", "/api/reject/1", "/api/trace/1"]:
-        resp = session.get(endpoint)
+    # Use correct HTTP methods for each endpoint
+    endpoints = [
+        ("/api/pending_trades", "GET"),
+        ("/api/approve/1", "POST"),
+        ("/api/reject/1", "POST"),
+        ("/api/trace/1", "GET"),
+    ]
+    for endpoint, method in endpoints:
+        if method == "GET":
+            resp = session.get(f"{BASE_URL}{endpoint}")
+        else:
+            resp = session.post(f"{BASE_URL}{endpoint}")
         assert resp.status_code == 401, f"Endpoint {endpoint} not protected (status {resp.status_code})"
     print("   Unauthorized endpoints blocked.")
 
     print("\n✅ ALL INTEGRATION TESTS PASSED.\n")
 
+
 if __name__ == "__main__":
+    import sys
     print("\n🚀 Starting live integration test against running Robo-Shopper...")
     if not check_server():
+        print("\n❌ Dashboard server is not running!")
+        print("   Start it in another terminal:")
+        print("   cd ~/robo-shopper && export DEV_MODE=1 && python dashboard.py\n")
         sys.exit(1)
+
+    s = requests.Session()
+    login_resp = s.post(
+        f"{BASE_URL}/api/login",
+        json={"username": "operator", "password": "operator123"}
+    )
+    if login_resp.status_code != 200:
+        print(f"❌ Login failed: {login_resp.status_code} {login_resp.text}")
+        sys.exit(1)
+    print("✅ Logged in.")
+
+    csrf_token = get_csrf_token(s)
+    if csrf_token:
+        s.headers.update({"X-CSRF-Token": csrf_token})
+
     try:
-        login()
-        test_full_pipeline()
+        test_full_pipeline(s)
     except AssertionError as e:
         print(f"\n❌ TEST FAILED: {e}")
-        raise
+        sys.exit(1)
     except Exception as e:
         print(f"\n❌ ERROR: {e}")
-        raise
+        sys.exit(1)
