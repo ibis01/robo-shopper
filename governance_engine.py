@@ -58,33 +58,27 @@ def _ensure_schema():
 _ensure_schema()
 
 # ------------------------------------------------------------------
-# SHARED HELPER: Compute proposal hash consistently
+# SHARED HELPER: Compute proposal hash with deterministic rounding
 # ------------------------------------------------------------------
 def _get_proposal_hash(trade: Dict[str, Any]) -> str:
     """
-    Computes the proposal hash using STORED risk metrics for consistency.
-    If risk metrics are missing (e.g., old schema), computes them from core parameters.
-    This ensures non‑tampered trades always produce the same hash.
+    Computes the proposal hash from immutable core parameters.
+    Uses the SAME rounding as propose_trade to guarantee consistency.
     """
     entry = float(trade["entry_price"])
     stop = float(trade["stop_loss"])
     qty = float(trade["quantity"])
     balance = float(trade.get("portfolio_balance", 10000.0))
 
-    # Use stored risk metrics if available, otherwise compute
-    if "risk_amount" in trade and trade["risk_amount"] is not None:
-        risk_amount = float(trade["risk_amount"])
-    else:
-        risk_amount = abs(entry - stop) * qty
+    # Compute risk metrics with rounding (match propose_trade)
+    risk_per_unit = abs(entry - stop)
+    risk_amount = round(risk_per_unit * qty, 8)
+    risk_percent = round(risk_amount / balance, 6) if balance > 0 else 0.02
 
-    if "risk_percent" in trade and trade["risk_percent"] is not None:
-        risk_percent = float(trade["risk_percent"])
-    else:
-        risk_percent = risk_amount / balance if balance > 0 else 0.02
-
-    # Cap risk_percent to max 1.0 to avoid Pydantic validation errors
+    # Cap risk_percent to 1.0 and adjust risk_amount to be consistent
     if risk_percent > 1.0:
         risk_percent = 1.0
+        risk_amount = risk_percent * balance
 
     expires_at_str = trade.get("proposal_expires_at")
     if not expires_at_str:
@@ -117,7 +111,6 @@ def _get_proposal_hash(trade: Dict[str, Any]) -> str:
 # TOKEN MANAGEMENT
 # ------------------------------------------------------------------
 def _create_approval_token(trade_id: int, proposal_hash: str, policy_version: str, requested_by: str, conn: sqlite3.Connection) -> Dict[str, Any]:
-    """Mints a cryptographically secure, one-time approval token."""
     token = secrets.token_hex(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     expires_at = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -129,7 +122,6 @@ def _create_approval_token(trade_id: int, proposal_hash: str, policy_version: st
     return {"approval_token": token, "expires_at": expires_at.isoformat()}
 
 def _validate_and_consume_token_in_transaction(conn: sqlite3.Connection, approval_token: str) -> Tuple[Optional[int], Optional[str], Optional[str], Optional[str]]:
-    """Validates token, checks expiry/replay, and marks as used."""
     token_hash = hashlib.sha256(approval_token.encode()).hexdigest()
     cursor = conn.execute(
         "SELECT id, trade_id, token_hash, proposal_hash, policy_version, expires_at, used_at FROM approval_tokens WHERE token_hash = ?",
@@ -149,10 +141,9 @@ def _validate_and_consume_token_in_transaction(conn: sqlite3.Connection, approva
     return trade_id, token_hash, token_proposal_hash, policy_version
 
 # ------------------------------------------------------------------
-# 1. SCREENING (Deterministic Veto Gate)
+# 1. SCREENING
 # ------------------------------------------------------------------
 def screen_trade(trade_id: int) -> Dict[str, Any]:
-    """Runs deterministic risk, exposure, and circuit breaker checks."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade: return {"status": "ERROR", "reason": "Trade not found."}
     if trade["status"] != TradeStatus.PROPOSED.value:
@@ -188,11 +179,9 @@ def screen_trade(trade_id: int) -> Dict[str, Any]:
     return {"status": "SUCCESS", "message": "Passed all gates."}
 
 # ------------------------------------------------------------------
-# 2. REQUEST APPROVAL (Idempotent – reuses existing active token)
+# 2. REQUEST APPROVAL (Idempotent)
 # ------------------------------------------------------------------
 def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
-    """Mints a one-time approval token for an already screened trade.
-    Idempotent: if an active token exists, reuses it."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade: return {"status": "ERROR", "reason": "Trade not found."}
     if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
@@ -201,7 +190,6 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
     if not trade.get("proposal_expires_at"):
         return {"status": "REJECTED", "reason": "No expiration set."}
     
-    # --- IDEMPOTENCY: check for existing active token ---
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     cursor = conn.cursor()
@@ -222,9 +210,7 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
             "policy_version": stored_policy,
             "message": "Existing active token reused."
         }
-    # --- End idempotency check ---
 
-    # Use shared helper for consistent hash computation
     proposal_hash = _get_proposal_hash(trade)
     policy_version = "1.0.0"
 
@@ -254,10 +240,9 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
         conn.close()
 
 # ------------------------------------------------------------------
-# 3. APPROVE TRADE (Consumes Token & Transitions State)
+# 3. APPROVE TRADE
 # ------------------------------------------------------------------
 def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str, Any]:
-    """Validates the token and transitions the trade to APPROVED."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     try:
@@ -301,10 +286,9 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         conn.close()
 
 # ------------------------------------------------------------------
-# 4. EXECUTE TRADE (With Hash Verification)
+# 4. EXECUTE TRADE
 # ------------------------------------------------------------------
 def execute_trade(trade_id: int, execution_price: float, executed_by: str = "execution_gateway") -> Dict[str, Any]:
-    """Transitions an APPROVED trade to EXECUTED with hash verification."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
@@ -317,7 +301,6 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
     if not stored_hash:
         return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    # Recompute hash using stored risk metrics for consistency
     computed_hash = _get_proposal_hash(trade)
     
     if computed_hash != stored_hash:
@@ -334,11 +317,6 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
 # 5. DASHBOARD GOVERNANCE BRIDGE
 # ------------------------------------------------------------------
 def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
-    """
-    Server-side bridge: resolves trade_id to its raw approval token and delegates
-    to the existing cryptographic approve_trade() primitive.
-    The browser NEVER sees the token.
-    """
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": "Trade not found."}
@@ -354,13 +332,10 @@ def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
             (trade_id,)
         )
         row = cursor.fetchone()
-        
         if not row:
             return {"status": "ERROR", "reason": "No active approval token found."}
-        
         token = row[0]
         conn.close()
-        
         return approve_trade(token, approved_by="human_dashboard")
     except Exception as e:
         try: conn.close()
@@ -368,15 +343,11 @@ def dashboard_approve_trade(trade_id: int) -> Dict[str, Any]:
         return {"status": "ERROR", "reason": str(e)}
 
 def dashboard_reject_trade(trade_id: int) -> Dict[str, Any]:
-    """
-    Server-side bridge: uses the CANONICAL state machine to reject the trade.
-    """
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": "Trade not found."}
     if trade["status"] != TradeStatus.AWAITING_APPROVAL.value:
         return {"status": "ERROR", "reason": f"Trade is {trade['status']}, must be awaiting_approval."}
-    
     return transition_trade(
         trade_id, 
         TradeStatus.REJECTED, 
@@ -385,10 +356,9 @@ def dashboard_reject_trade(trade_id: int) -> Dict[str, Any]:
     )
 
 # ------------------------------------------------------------------
-# 6. EXECUTION GATEWAY (Dry-Run Command Generation)
+# 6. EXECUTION GATEWAY
 # ------------------------------------------------------------------
 def generate_execution_command(trade_id: int) -> Dict[str, Any]:
-    """Generates a dry-run CLI command ONLY for an APPROVED trade (not yet executed)."""
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": "Trade not found."}
@@ -397,10 +367,8 @@ def generate_execution_command(trade_id: int) -> Dict[str, Any]:
     if trade["status"] != TradeStatus.APPROVED.value:
         return {"status": "REJECTED", "reason": f"Trade is {trade['status']}. Must be 'approved'."}
     
-    # Use shared helper for consistent hash verification
     computed_hash = _get_proposal_hash(trade)
     stored_hash = trade.get("proposal_hash")
-    
     if not stored_hash or computed_hash != stored_hash:
         return {"status": "REJECTED", "reason": "PROPOSAL TAMPERED: Hash mismatch."}
     
@@ -409,4 +377,3 @@ def generate_execution_command(trade_id: int) -> Dict[str, Any]:
         "command": f"onchainos --dry-run {trade['side']} {trade['quantity']} {trade['symbol']}",
         "symbol": trade["symbol"], "side": trade["side"], "quantity": trade["quantity"]
     }
-    
