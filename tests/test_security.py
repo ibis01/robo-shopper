@@ -260,3 +260,32 @@ def test_modified_expiration_fails(clean_db):
         expires_at=expires_2
     )
     assert p1.compute_hash() != p2.compute_hash()
+
+def test_get_proposal_hash_fails_on_missing_balance(clean_db):
+    """Invariant #1: _get_proposal_hash must fail closed when portfolio_balance is missing."""
+    from governance_engine import _get_proposal_hash
+    prop = propose_trade("BTC", "long", 0.01, 60000, 59500, reasoning="test")
+    trade = get_trade(prop["trade_id"])
+    # Remove the portfolio_balance field to simulate corruption
+    del trade["portfolio_balance"]
+    with pytest.raises(KeyError):
+        _get_proposal_hash(trade)
+
+def test_approve_trade_rejects_post_token_trade_tampering(clean_db):
+    """Invariant #3: approve_trade must independently recompute the hash and reject tampering."""
+    tid = create_proposed_trade()
+    req = screen_and_request_approval(tid)
+    assert req["status"] == "success"
+    token = req["approval_token"]
+    # Tamper with the trade after token minting
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("UPDATE trades SET quantity = 999.0 WHERE id = ?", (tid,))
+    conn.commit()
+    conn.close()
+    # Approval should fail due to hash mismatch
+    result = approve_trade(token)
+    assert result["status"] == "REJECTED"
+    assert "PROPOSAL TAMPERED" in result["reason"]
+    # Ensure the trade is still in AWAITING_APPROVAL (not approved)
+    trade = get_trade(tid)
+    assert trade["status"] == TradeStatus.AWAITING_APPROVAL.value

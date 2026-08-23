@@ -56,11 +56,13 @@ def _get_proposal_hash(trade: Dict[str, Any]) -> str:
     """
     Computes the proposal hash from immutable core parameters.
     Uses the same rounding logic as propose_trade to guarantee consistency.
+    FAILS CLOSED: raises KeyError if portfolio_balance is missing.
     """
     entry = float(trade["entry_price"])
     stop = float(trade["stop_loss"])
     qty = float(trade["quantity"])
-    balance = float(trade.get("portfolio_balance", 10000.0))
+    # NO DEFAULT – must be present (fail closed)
+    balance = float(trade["portfolio_balance"])
 
     # Compute risk metrics with rounding (match propose_trade)
     risk_per_unit = abs(entry - stop)
@@ -233,35 +235,71 @@ def request_approval(trade_id: int, requested_by: str = "ai") -> Dict[str, Any]:
         conn.close()
 
 # ------------------------------------------------------------------
-# 3. APPROVE TRADE
+# 3. APPROVE TRADE (with independent hash recomputation)
 # ------------------------------------------------------------------
 def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str, Any]:
+    """Validates the token and transitions the trade to APPROVED."""
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.execute("PRAGMA journal_mode=WAL;")
     try:
         conn.execute("BEGIN EXCLUSIVE")
+        
         trade_id, token_hash, token_proposal_hash, token_policy = _validate_and_consume_token_in_transaction(conn, approval_token)
         if trade_id is None:
             conn.rollback()
             return {"status": "REJECTED", "reason": "Invalid, expired, or used token."}
-        row = conn.execute("SELECT id, status, proposal_hash, policy_version FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        
+        # Fetch all fields needed to recompute the current hash
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT id, status, proposal_hash, policy_version,
+                   entry_price, quantity, stop_loss, portfolio_balance,
+                   risk_percent, risk_amount, proposal_expires_at,
+                   symbol, side, take_profit, reasoning
+            FROM trades WHERE id = ?
+        """, (trade_id,))
+        row = cursor.fetchone()
         if not row:
             conn.rollback()
             return {"status": "REJECTED", "reason": "Trade not found."}
-        tid, status, trade_proposal_hash, trade_policy_version = row
+        
+        # Build a dict for _get_proposal_hash
+        col_names = [
+            "id", "status", "proposal_hash", "policy_version",
+            "entry_price", "quantity", "stop_loss", "portfolio_balance",
+            "risk_percent", "risk_amount", "proposal_expires_at",
+            "symbol", "side", "take_profit", "reasoning"
+        ]
+        trade = dict(zip(col_names, row))
+        
+        # Recompute current hash from the trade's current state
+        current_hash = _get_proposal_hash(trade)
+        if current_hash != token_proposal_hash:
+            conn.rollback()
+            return {
+                "status": "REJECTED",
+                "reason": f"PROPOSAL TAMPERED: trade modified after token minted. "
+                          f"Token: {token_proposal_hash[:12]}... Current: {current_hash[:12]}..."
+            }
+        
+        # Now check status, policy, etc.
+        tid, status, trade_proposal_hash, trade_policy_version = row[:4]  # already fetched above
         if status != "awaiting_approval":
             conn.rollback()
             return {"status": "REJECTED", "reason": f"Trade is {status}."}
         if trade_proposal_hash != token_proposal_hash:
+            # This should already be caught by the recompute, but keep for safety
             conn.rollback()
-            return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: trade modified after token minted."}
+            return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: stored hash differs from token."}
         if trade_policy_version != token_policy:
             conn.rollback()
             return {"status": "REJECTED", "reason": "POLICY MISMATCH: trade policy version changed after token minted."}
+        
         now = datetime.now(timezone.utc).isoformat()
         conn.execute("UPDATE trades SET status = 'approved', updated_at = ? WHERE id = ?", (now, trade_id))
         conn.commit()
         return {"status": "SUCCESS", "trade_id": trade_id, "new_status": "approved"}
+        
     except Exception as e:
         try:
             conn.rollback()
@@ -272,7 +310,7 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         conn.close()
 
 # ------------------------------------------------------------------
-# 4. EXECUTE TRADE (with idempotency and tamper detection)
+# 4. EXECUTE TRADE (with idempotency)
 # ------------------------------------------------------------------
 def execute_trade(trade_id: int, execution_price: float, executed_by: str = "execution_gateway") -> Dict[str, Any]:
     trade = trade_memory_mcp.get_trade(trade_id)
