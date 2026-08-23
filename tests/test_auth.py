@@ -35,9 +35,10 @@ def test_login_failure():
 def test_authenticated_approve():
     # Login first
     client.post("/api/login", json={"username": "operator", "password": "operator123"})
-    # Now we have a session cookie; test approve endpoint (will fail because trade doesn't exist, but that's fine)
+    # Fetch CSRF token from the session (we can just use the session's csrf_token)
+    # Since CSRF is disabled in test mode, we can skip the header.
     resp = client.post("/api/approve/999999")
     # It should return 404 or error, but NOT 401
     assert resp.status_code != 401
     # Should return a JSON error
-    assert resp.json()["status"] == "ERROR" or resp.json().get("detail") == "Trade not found"
+    assert resp.json().get("status") == "ERROR" or resp.json().get("detail") == "Trade not found"

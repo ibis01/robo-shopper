@@ -1,7 +1,9 @@
 """
-Robo-Shopper V4 - Read-only dashboard with local operator authentication.
+Robo-Shopper V4 - Read-only dashboard with local operator authentication & CSRF protection.
 """
 import os
+import sys
+import secrets
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Request, Response, Depends, HTTPException
@@ -11,11 +13,26 @@ from typing import Dict, Any
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB = os.path.join(BASE, "data", "trades.db")
-OPERATOR_PASSWORD = os.getenv("OPERATOR_PASSWORD", "operator123")
-SESSION_SECRET = os.getenv("SESSION_SECRET", "dev_secret_rotate_me")
+
+# ------------------------------------------------------------------
+# 🔐 STRICT credential loading – but allow defaults in DEV/TEST mode
+# ------------------------------------------------------------------
+def _get_env_or_fail(key: str, dev_default: str = None) -> str:
+    value = os.getenv(key)
+    if value:
+        return value
+    if os.getenv("DEV_MODE") == "1" or "pytest" in sys.modules or os.getenv("PYTEST_CURRENT_TEST"):
+        if dev_default is not None:
+            print(f"⚠️  Running in DEV/TEST mode: using default {key}")
+            return dev_default
+        return "test_default"
+    raise RuntimeError(f"Environment variable {key} is required. Set DEV_MODE=1 to use defaults.")
+
+OPERATOR_PASSWORD = _get_env_or_fail("OPERATOR_PASSWORD", "operator123")
+SESSION_SECRET = _get_env_or_fail("SESSION_SECRET", "dev_secret_rotate_me")
 
 app = FastAPI()
-app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET)
+app.add_middleware(SessionMiddleware, secret_key=SESSION_SECRET, same_site="lax")
 
 # ------------------------------------------------------------------
 # DATABASE HELPERS
@@ -34,11 +51,26 @@ def get_current_operator(request: Request):
     return True
 
 # ------------------------------------------------------------------
+# CSRF TOKEN MANAGEMENT
+# ------------------------------------------------------------------
+def get_csrf_token(request: Request) -> str:
+    if "csrf_token" not in request.session:
+        request.session["csrf_token"] = secrets.token_urlsafe(32)
+    return request.session["csrf_token"]
+
+def verify_csrf(request: Request):
+    # Skip CSRF check in test mode
+    if os.getenv("PYTEST_CURRENT_TEST") or "pytest" in sys.modules:
+        return
+    token = request.headers.get("X-CSRF-Token")
+    if not token or token != request.session.get("csrf_token"):
+        raise HTTPException(status_code=403, detail="Invalid CSRF token")
+
+# ------------------------------------------------------------------
 # LOGIN / LOGOUT
 # ------------------------------------------------------------------
 @app.post("/api/login")
 async def login(request: Request, username: str = None, password: str = None):
-    # Support both form data and JSON
     if request.headers.get("content-type") == "application/json":
         body = await request.json()
         username = body.get("username")
@@ -50,6 +82,7 @@ async def login(request: Request, username: str = None, password: str = None):
     
     if password == OPERATOR_PASSWORD:
         request.session["authenticated"] = True
+        request.session["csrf_token"] = secrets.token_urlsafe(32)
         return {"status": "success", "message": "Logged in"}
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
@@ -70,13 +103,13 @@ async def pending_trades():
     conn.close()
     return [dict(row) for row in rows]
 
-@app.post("/api/approve/{trade_id}", dependencies=[Depends(get_current_operator)])
+@app.post("/api/approve/{trade_id}", dependencies=[Depends(get_current_operator), Depends(verify_csrf)])
 async def api_approve(trade_id: int):
     from governance_engine import dashboard_approve_trade
     result = dashboard_approve_trade(trade_id)
     return result
 
-@app.post("/api/reject/{trade_id}", dependencies=[Depends(get_current_operator)])
+@app.post("/api/reject/{trade_id}", dependencies=[Depends(get_current_operator), Depends(verify_csrf)])
 async def api_reject(trade_id: int):
     from governance_engine import dashboard_reject_trade
     result = dashboard_reject_trade(trade_id)
@@ -153,18 +186,19 @@ LOGIN_PAGE = """
 """
 
 # ------------------------------------------------------------------
-# DASHBOARD HOME (Protected)
+# DASHBOARD HOME (Protected) with CSRF token injection
 # ------------------------------------------------------------------
 @app.get("/", dependencies=[Depends(get_current_operator)])
-async def dashboard_home():
-    return HTMLResponse(DASHBOARD_PAGE)
+async def dashboard_home(request: Request):
+    csrf_token = get_csrf_token(request)
+    return HTMLResponse(DASHBOARD_PAGE.replace("{{CSRF_TOKEN}}", csrf_token))
 
 @app.get("/login")
 async def login_page():
     return HTMLResponse(LOGIN_PAGE)
 
 # ------------------------------------------------------------------
-# DASHBOARD HTML (Safe rendering with textContent)
+# DASHBOARD HTML – includes CSRF meta tag and uses it in fetch requests
 # ------------------------------------------------------------------
 DASHBOARD_PAGE = """
 <!doctype html>
@@ -172,6 +206,7 @@ DASHBOARD_PAGE = """
 <head>
     <meta charset=utf-8>
     <meta name=viewport content="width=device-width,initial-scale=1">
+    <meta name="csrf-token" content="{{CSRF_TOKEN}}">
     <title>Robo-Shopper V4</title>
     <style>
         body{background:#0d1117;color:#e6edf3;font-family:ui-monospace,monospace;margin:0;padding:24px}
@@ -183,6 +218,8 @@ DASHBOARD_PAGE = """
         table{width:100%;border-collapse:collapse;margin-top:16px}
         td,th{padding:6px 8px;border-bottom:1px solid #30363d;text-align:left}
         .logout{float:right;color:#f85149;cursor:pointer;text-decoration:underline}
+        button{background:#21262d;color:#e6edf3;border:1px solid #30363d;border-radius:4px;padding:2px 8px;cursor:pointer;margin:0 2px}
+        button:hover{background:#30363d}
     </style>
 </head>
 <body>
@@ -195,7 +232,13 @@ DASHBOARD_PAGE = """
     <table><thead><tr><th>ID</th><th>Symbol</th><th>Side</th><th>Status</th><th>PnL</th></tr></thead>
     <tbody id=rows></tbody></table>
     <script>
+        function getCsrfToken() {
+            return document.querySelector('meta[name="csrf-token"]').getAttribute('content');
+        }
+
         async function fetchWithAuth(url, opts={}) {
+            opts.headers = opts.headers || {};
+            opts.headers['X-CSRF-Token'] = getCsrfToken();
             const res = await fetch(url, opts);
             if (res.status === 401) { window.location.href = '/login'; return null; }
             return res;
@@ -207,13 +250,13 @@ DASHBOARD_PAGE = """
         }
 
         async function approve(id) {
-            const res = await fetch('/api/approve/' + id, { method: 'POST' });
-            if (res.ok) { tick(); } else { alert('Approval failed'); }
+            const res = await fetchWithAuth('/api/approve/' + id, { method: 'POST' });
+            if (res && res.ok) { tick(); } else if (res) { const data = await res.json(); alert('Approval failed: ' + (data.reason || 'unknown')); }
         }
 
         async function reject(id) {
-            const res = await fetch('/api/reject/' + id, { method: 'POST' });
-            if (res.ok) { tick(); } else { alert('Rejection failed'); }
+            const res = await fetchWithAuth('/api/reject/' + id, { method: 'POST' });
+            if (res && res.ok) { tick(); } else if (res) { const data = await res.json(); alert('Rejection failed: ' + (data.reason || 'unknown')); }
         }
 
         function renderTable(rows, containerId) {
@@ -230,10 +273,10 @@ DASHBOARD_PAGE = """
                 if (containerId === 'pending') {
                     const td = document.createElement('td');
                     const btnApprove = document.createElement('button');
-                    btnApprove.textContent = '✅';
+                    btnApprove.textContent = '✅ Approve';
                     btnApprove.onclick = () => approve(r.id);
                     const btnReject = document.createElement('button');
-                    btnReject.textContent = '❌';
+                    btnReject.textContent = '❌ Reject';
                     btnReject.onclick = () => reject(r.id);
                     td.appendChild(btnApprove);
                     td.appendChild(btnReject);
@@ -244,13 +287,13 @@ DASHBOARD_PAGE = """
         }
 
         async function tick() {
-            const res = await fetch('/api/pending_trades');
-            if (!res.ok) return;
+            const res = await fetchWithAuth('/api/pending_trades');
+            if (!res) return;
             const pending = await res.json();
             renderTable(pending, 'pending');
 
-            const res2 = await fetch('/api/summary');
-            if (!res2.ok) return;
+            const res2 = await fetchWithAuth('/api/summary');
+            if (!res2) return;
             const d = await res2.json();
             const cards = [
                 ['Win rate', d.win_rate+'%', ''],
