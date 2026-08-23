@@ -22,12 +22,13 @@ def _ensure_schema():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     cursor = conn.cursor()
     cursor.execute("PRAGMA journal_mode=WAL;")
+    # 🔒 Store both token and token_hash – token for retrieval, hash for validation
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS approval_tokens (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             trade_id INTEGER NOT NULL,
-            token TEXT,
-            token_hash TEXT NOT NULL,
+            token TEXT NOT NULL UNIQUE,
+            token_hash TEXT NOT NULL UNIQUE,
             proposal_hash TEXT,
             policy_version TEXT,
             requested_by TEXT,
@@ -36,14 +37,6 @@ def _ensure_schema():
             used_at TEXT
         )
     """)
-    try:
-        cursor.execute("ALTER TABLE approval_tokens ADD COLUMN token TEXT")
-    except sqlite3.OperationalError:
-        pass
-    try:
-        cursor.execute("ALTER TABLE approval_tokens ADD COLUMN proposal_hash TEXT")
-    except sqlite3.OperationalError:
-        pass
     conn.commit()
     conn.close()
 
@@ -61,15 +54,12 @@ def _get_proposal_hash(trade: Dict[str, Any]) -> str:
     entry = float(trade["entry_price"])
     stop = float(trade["stop_loss"])
     qty = float(trade["quantity"])
-    # NO DEFAULT – must be present (fail closed)
     balance = float(trade["portfolio_balance"])
 
-    # Compute risk metrics with rounding (match propose_trade)
     risk_per_unit = abs(entry - stop)
     risk_amount = round(risk_per_unit * qty, 8)
     risk_percent = round(risk_amount / balance, 6) if balance > 0 else 0.02
 
-    # Cap risk_percent to 1.0 to satisfy Pydantic validation
     if risk_percent > 1.0:
         risk_percent = 1.0
         risk_amount = risk_percent * balance
@@ -249,7 +239,6 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
             conn.rollback()
             return {"status": "REJECTED", "reason": "Invalid, expired, or used token."}
         
-        # Fetch all fields needed to recompute the current hash
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id, status, proposal_hash, policy_version,
@@ -263,7 +252,6 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
             conn.rollback()
             return {"status": "REJECTED", "reason": "Trade not found."}
         
-        # Build a dict for _get_proposal_hash
         col_names = [
             "id", "status", "proposal_hash", "policy_version",
             "entry_price", "quantity", "stop_loss", "portfolio_balance",
@@ -272,7 +260,6 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
         ]
         trade = dict(zip(col_names, row))
         
-        # Recompute current hash from the trade's current state
         current_hash = _get_proposal_hash(trade)
         if current_hash != token_proposal_hash:
             conn.rollback()
@@ -282,13 +269,11 @@ def approve_trade(approval_token: str, approved_by: str = "system") -> Dict[str,
                           f"Token: {token_proposal_hash[:12]}... Current: {current_hash[:12]}..."
             }
         
-        # Now check status, policy, etc.
-        tid, status, trade_proposal_hash, trade_policy_version = row[:4]  # already fetched above
+        tid, status, trade_proposal_hash, trade_policy_version = row[:4]
         if status != "awaiting_approval":
             conn.rollback()
             return {"status": "REJECTED", "reason": f"Trade is {status}."}
         if trade_proposal_hash != token_proposal_hash:
-            # This should already be caught by the recompute, but keep for safety
             conn.rollback()
             return {"status": "REJECTED", "reason": "PROPOSAL MISMATCH: stored hash differs from token."}
         if trade_policy_version != token_policy:
@@ -317,11 +302,9 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
     if not trade:
         return {"status": "ERROR", "reason": f"Trade {trade_id} not found."}
     
-    # Idempotency: if already EXECUTED, return success with idempotent flag
     if trade["status"] == TradeStatus.EXECUTED.value:
         return {"status": "SUCCESS", "new_status": TradeStatus.EXECUTED.value, "idempotent": True}
     
-    # Must be APPROVED to execute
     if trade["status"] != TradeStatus.APPROVED.value:
         return {"status": "REJECTED", "reason": f"Trade {trade_id} is '{trade['status']}', must be 'approved'."}
     
@@ -329,9 +312,7 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
     if not stored_hash:
         return {"status": "REJECTED", "reason": "No proposal hash."}
     
-    # Compute hash from core parameters – this will detect tampering
     computed_hash = _get_proposal_hash(trade)
-    
     if computed_hash != stored_hash:
         return {
             "status": "REJECTED",
@@ -340,7 +321,6 @@ def execute_trade(trade_id: int, execution_price: float, executed_by: str = "exe
             "computed_hash": computed_hash
         }
     
-    # Transition to EXECUTED using state machine (atomic)
     return transition_trade(
         trade_id,
         TradeStatus.EXECUTED,
@@ -395,10 +375,8 @@ def generate_execution_command(trade_id: int) -> Dict[str, Any]:
     trade = trade_memory_mcp.get_trade(trade_id)
     if not trade:
         return {"status": "ERROR", "reason": "Trade not found."}
-    # Reject if already executed
     if trade["status"] == TradeStatus.EXECUTED.value:
         return {"status": "REJECTED", "reason": "Trade already executed."}
-    # Only APPROVED can generate command
     if trade["status"] != TradeStatus.APPROVED.value:
         return {"status": "REJECTED", "reason": f"Trade is {trade['status']}. Must be 'approved'."}
     

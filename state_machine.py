@@ -17,7 +17,7 @@ ALLOWED_TRANSITIONS = {
     TradeStatus.PROPOSED: [TradeStatus.RISK_CHECKED, TradeStatus.REJECTED],
     TradeStatus.RISK_CHECKED: [TradeStatus.AWAITING_APPROVAL, TradeStatus.REJECTED],
     TradeStatus.AWAITING_APPROVAL: [TradeStatus.APPROVED, TradeStatus.REJECTED],
-    TradeStatus.APPROVED: [TradeStatus.EXECUTED, TradeStatus.CLOSED, TradeStatus.REJECTED],
+    TradeStatus.APPROVED: [TradeStatus.EXECUTED, TradeStatus.CLOSED],  # cannot reject after approval
     TradeStatus.EXECUTED: [TradeStatus.CLOSED],
     TradeStatus.REJECTED: [],
     TradeStatus.CLOSED: [],
@@ -35,13 +35,36 @@ AUTHORIZED_ACTORS = {
 }
 
 # ------------------------------------------------------------------
-# IDEMPOTENCY CHECK (using the provided connection)
+# IDEMPOTENCY CHECK
 # ------------------------------------------------------------------
 def _is_already_in_state(conn: sqlite3.Connection, trade_id: int, target_status: TradeStatus) -> bool:
     cursor = conn.cursor()
     cursor.execute("SELECT status FROM trades WHERE id = ?", (trade_id,))
     row = cursor.fetchone()
     return row and row[0] == target_status.value
+
+# ------------------------------------------------------------------
+# 🔒 IMMUTABLE AUDIT LOG (appended to the same connection)
+# ------------------------------------------------------------------
+def _log_event(conn: sqlite3.Connection, trade_id: int, event_type: str, actor_type: str, old_status: str, new_status: str, metadata: dict):
+    """Append an immutable audit event to the trade_events table."""
+    import json
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS trade_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER,
+            event_type TEXT,
+            actor_type TEXT,
+            old_status TEXT,
+            new_status TEXT,
+            metadata TEXT,
+            created_at TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        INSERT INTO trade_events (trade_id, event_type, actor_type, old_status, new_status, metadata, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (trade_id, event_type, actor_type, old_status, new_status, json.dumps(metadata), datetime.now(timezone.utc).isoformat()))
 
 # ------------------------------------------------------------------
 # SINGLE STATE-TRANSITION AUTHORITY
@@ -63,7 +86,6 @@ def transition_trade(
     metadata = metadata or {}
     own_connection = False
     
-    # Use provided connection or create our own
     if conn is None:
         conn = sqlite3.connect(DB_PATH)
         own_connection = True
@@ -170,7 +192,6 @@ def transition_trade(
         
         params = [target_status.value, datetime.now(timezone.utc).isoformat(), actor.value]
 
-        # Add metadata fields that map to real columns (value appended in same order)
         if metadata:
             _cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
             for key in ["execution_price", "executed_by"]:
@@ -194,9 +215,8 @@ def transition_trade(
             set_clauses.append("transition_metadata = ?")
             params.append(json.dumps(metadata))
         
-        # WHERE clause: id = ? AND status = ? (atomic)
-        params.append(trade_id)               # for WHERE id =
-        params.append(current_status.value)   # for WHERE status =
+        params.append(trade_id)
+        params.append(current_status.value)
         
         query = f"""
             UPDATE trades 
@@ -219,6 +239,16 @@ def transition_trade(
         
         if own_connection:
             conn.commit()
+            # 🔒 Append immutable audit event
+            _log_event(
+                conn,
+                trade_id,
+                "STATE_TRANSITION",
+                actor.value,
+                current_status.value,
+                target_status.value,
+                metadata
+            )
             conn.close()
         
         return {
