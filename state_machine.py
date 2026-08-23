@@ -44,10 +44,10 @@ def _is_already_in_state(conn: sqlite3.Connection, trade_id: int, target_status:
     return row and row[0] == target_status.value
 
 # ------------------------------------------------------------------
-# 🔒 IMMUTABLE AUDIT LOG (appended to the same connection)
+# 🔒 IMMUTABLE AUDIT LOG (uses the same connection)
 # ------------------------------------------------------------------
 def _log_event(conn: sqlite3.Connection, trade_id: int, event_type: str, actor_type: str, old_status: str, new_status: str, metadata: dict):
-    """Append an immutable audit event to the trade_events table."""
+    """Append an immutable audit event using the provided connection."""
     import json
     conn.execute("""
         CREATE TABLE IF NOT EXISTS trade_events (
@@ -80,8 +80,6 @@ def transition_trade(
     """
     SINGLE SOURCE OF TRUTH for all trade state changes.
     Enforces: legality, actor auth, hash match, atomicity, idempotency.
-    
-    If a connection is provided, the transaction is managed externally.
     """
     metadata = metadata or {}
     own_connection = False
@@ -94,7 +92,7 @@ def transition_trade(
     try:
         cursor = conn.cursor()
         
-        # 1. Idempotency
+        # Idempotency
         if _is_already_in_state(conn, trade_id, target_status):
             if own_connection:
                 conn.commit()
@@ -106,13 +104,12 @@ def transition_trade(
                 "idempotent": True
             }
         
-        # 2. Fetch current state
+        # Fetch current state
         cursor.execute("""
             SELECT id, status, proposal_hash, entry_price, quantity, stop_loss
             FROM trades WHERE id = ?
         """, (trade_id,))
         row = cursor.fetchone()
-        
         if not row:
             if own_connection:
                 conn.rollback()
@@ -122,7 +119,7 @@ def transition_trade(
         current_status = TradeStatus(row[1])
         stored_hash = row[2]
         
-        # 3. Validate transition legality
+        # Validate transition legality
         if target_status not in ALLOWED_TRANSITIONS.get(current_status, []):
             if own_connection:
                 conn.rollback()
@@ -138,7 +135,7 @@ def transition_trade(
                 "target_status": target_status.value
             }
         
-        # 4. Validate actor
+        # Validate actor
         authorized = AUTHORIZED_ACTORS.get(target_status, [])
         if actor not in authorized:
             if own_connection:
@@ -151,7 +148,7 @@ def transition_trade(
                 "authorized_actors": [a.value for a in authorized]
             }
         
-        # 5. Special: EXECUTED requires approval hash
+        # Special: EXECUTED requires approval hash
         if target_status == TradeStatus.EXECUTED:
             if not require_approval_hash:
                 if own_connection:
@@ -183,13 +180,12 @@ def transition_trade(
                     "message": f"EXECUTION BLOCKED: Trade must be APPROVED, but is {current_status.value}."
                 }
         
-        # 6. Build the atomic UPDATE
+        # Build the atomic UPDATE
         set_clauses = [
             "status = ?",
             "last_modified_at = ?",
             "last_modified_by = ?"
         ]
-        
         params = [target_status.value, datetime.now(timezone.utc).isoformat(), actor.value]
 
         if metadata:
@@ -237,19 +233,22 @@ def transition_trade(
                 "message": "Concurrent modification detected. Please retry."
             }
         
+        # 🔒 CRITICAL: Insert audit event BEFORE commit, using the same connection.
+        # This ensures both UPDATE and INSERT are in the same transaction.
+        _log_event(
+            conn,
+            trade_id,
+            "STATE_TRANSITION",
+            actor.value,
+            current_status.value,
+            target_status.value,
+            metadata
+        )
+        
         if own_connection:
             conn.commit()
-            # 🔒 Append immutable audit event
-            _log_event(
-                conn,
-                trade_id,
-                "STATE_TRANSITION",
-                actor.value,
-                current_status.value,
-                target_status.value,
-                metadata
-            )
             conn.close()
+        # If external connection, do NOT commit or close – caller handles it.
         
         return {
             "status": "SUCCESS",
