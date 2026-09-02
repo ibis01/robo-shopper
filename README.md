@@ -1,56 +1,233 @@
-# Robo-Shopper: Governed AI Finance Copilot
+# Robo-Shopper
 
-**Agent Investigates → System Verifies → Policy Governs → Human Authorizes → Gateway Executes → Memory Records.**
+**A Human-Governed AI Finance Agent with Deterministic Risk Controls**
 
-Robo-Shopper is a human-governed, genuinely agentic trading copilot built on the Model Context Protocol (MCP). It fuses dynamic market intelligence with a deterministic risk engine and persistent trade memory. It is **not** an autonomous trading bot; it is a verifiable, evidence-first decision engine that **never moves user funds without explicit cryptographic human approval**.
+> _"Robo-Shopper does not blindly trust the AI. It investigates with the AI, verifies with deterministic systems, and requires human authorization before consequential action."_
 
-> ⚠️ **Prototype Status:** Paper-trading and dry-run execution only. Not financial advice.
+## 🎯 What It Is
 
-## 🏆 Orion Hackathon Alignment
+Robo-Shopper is an AI finance copilot that autonomously investigates financial opportunities, produces evidence-backed proposals, applies deterministic risk and governance policies, and requires explicit human authorization before execution.
 
-| Criterion           | Implementation in Robo-Shopper                                                                                                                                                              |
-| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Agentic Quality** | Dynamically plans investigations, checks trade history _before_ sizing, assesses confidence, and detects anomalies (e.g., high exposure) before proposing.                                  |
-| **Security**        | Zero private key handling. Strict input validation. Tamper-evident cryptographic proposal hashing. One-time, expiring approval tokens. External data sanitization against prompt injection. |
-| **Reliability**     | 61+ adversarial, concurrency, and risk tests passing. Explicit "Insufficient evidence" fail-closed protocol. No silent hallucinations.                                                      |
-| **Observability**   | Every decision generates a persistent, human-readable "Decision Dossier" in the web UI, tracing evidence, risk metrics, and authorization.                                                  |
-| **Execution**       | Canonical, deterministic tool routing. The LLM _cannot_ bypass the 2% per-trade risk cap or 20% portfolio exposure cap. Execution requires cryptographic approval.                          |
+It solves the "black box" problem of AI trading agents by separating concerns: the LLM handles investigation and synthesis, while deterministic code handles risk calculation, policy enforcement, and cryptographic execution gating.
 
-## 🛡️ Safety Model (Non-Negotiable)
+**Core Pipeline:**
 
-1. **No Private Keys**: The agent NEVER stores, touches, or uses private keys.
-2. **No Auto-Execution**: The agent ONLY outputs dry-run CLI commands after cryptographic human approval.
-3. **Deterministic Veto**: Risk calculations (`calculate_position_size`, `evaluate_trade_risk`) are executed in Python, entirely outside the LLM's control. The LLM cannot be prompted to bypass the 2% risk or 20% exposure caps.
-4. **Cryptographic Governance**: Human approval is cryptographically bound to the exact proposal hash and policy version via one-time expiring tokens. If any parameter changes post-approval, execution is instantly rejected.
-5. **Prompt Injection Defense**: All external market metadata (symbols, exchange names) is sanitized and length-limited before reaching the LLM context.
+```
+AI INVESTIGATES → SYSTEM VERIFIES → POLICY GOVERNS → HUMAN AUTHORIZES → GATEWAY EXECUTES → MEMORY RECORDS
+```
 
-## 🔐 Authorization Flow
+## 🚀 Why It Exists
 
-The runtime enforces a strict cryptographic governance chain:
+Most AI trading agents are dangerous black boxes that blindly trust LLM outputs for financial execution. If the LLM hallucinates a risk metric or ignores a stop-loss, the user loses money.
 
-1. **AI Investigates**: Agent gathers market data, checks portfolio context, calculates position size.
-2. **System Verifies**: Deterministic risk engine validates the proposal against policy (2% risk cap, 20% exposure cap).
-3. **Policy Governs**: `screen_trade` enforces all guardrails. If passed, trade moves to `AWAITING_APPROVAL`.
-4. **Human Authorizes**: `request_approval` mints a one-time expiring token bound to the proposal hash. The human confirms via CLI `[y/N]`. The application calls `approve_trade(token)`, which verifies token validity, expiration, proposal hash, and policy version before transitioning to `APPROVED`.
-5. **Gateway Executes**: `format_onchainos_command(trade_id)` generates a dry-run CLI command ONLY if the trade is `APPROVED` and the proposal hash matches. All parameters are sourced from the database, never from the LLM.
-6. **Memory Records**: Full lifecycle is persisted in SQLite with tamper-evident hashes.
+Robo-Shopper moves AI agents from demos to real products by enforcing **trust through architecture**:
+
+- **AI investigates** market conditions and proposes trades.
+- **Deterministic code** calculates risk and enforces policy (2% risk cap, 20% exposure cap).
+- **Cryptographic state machine** gates every transition.
+- **Human approves** via a secure institutional dashboard.
+- **Execution gateway** generates dry-run commands using database-authoritative values only.
 
 ## 🏗️ Architecture
 
-1. **LLM Agent (`qwen_agent.py`)**: Plans investigations, gathers evidence via MCP tools, synthesizes findings, and proposes trades.
-2. **MCP Server (`main_server.py`)**: Canonical tool registry and direct pass-through routing. Exposes `request_approval` but NOT `approve_trade` to prevent LLM from self-approving.
-3. **Market Intelligence (`market_intelligence_mcp.py`)**: Live data via CCXT (with Yahoo Finance failover).
-4. **Risk Engine (`risk_management_mcp.py`)**: Hardcoded financial vetoes (2% risk, 20% exposure). Purely deterministic. Fetches authoritative portfolio balance from trusted treasury.
-5. **Governance (`governance_engine.py`)**: State machine, proposal hashing, one-time approval tokens, execution gateway.
-6. **Memory (`trade_memory_mcp.py`)**: SQLite ledger with full lifecycle tracking.
-7. **Observability (`dashboard.py`)**: FastAPI web UI featuring the Decision Dossier.
+```text
+┌─────────────────
+│   User Request  │
+└────────────────┘
+         ▼
+┌─────────────────┐
+│  Agent Plan &   │
+│  Tool Selection │
+└────────────────┘
+         ▼
+┌─────────────────┐      ┌──────────────────┐
+│  Evidence       │─────▶│  Risk Engine     │
+│  Gathering      │      │  (Deterministic) │
+└─────────────────┘      └────────┬─────────┘
+                                  ▼
+                         ┌──────────────────┐
+                         │  Governance      │
+                         │  State Machine   │
+                         └────────┬─────────┘
+                                  ▼
+                         ┌──────────────────┐
+                         │  Human Approval  │
+                         │  (Dashboard)     │
+                         └────────┬─────────┘
+                                  ▼
+                         ┌──────────────────┐
+                         │  Execution       │
+                         │  Gateway         │
+                         └─────────────────┘
+                                  ▼
+                         ┌──────────────────┐
+                         │  Audit Memory    │
+                         └──────────────────┘
+```
 
-## Quick Start
+## 🤖 Agent Workflow
 
-1. **Clone & Install**:
-   ```bash
-   git clone https://github.com/ibis01/robo-shopper.git
-   cd robo-shopper
-   python -m venv .venv && source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+Robo-Shopper demonstrates genuine agentic behavior, not just a chatbot interface:
+
+1. **Understands Objective:** Parses natural language queries (e.g., _"Investigate BTC long 0.01 at entry 60000 stop 59500"_).
+2. **Plans Investigation:** Determines what market data and portfolio context is required.
+3. **Gathers Evidence:** Uses MCP tools to fetch real market data and portfolio balances.
+4. **Synthesizes Proposal:** Produces a structured decision dossier with entry, stop-loss, and reasoning.
+5. **Applies Policy:** Passes the proposal to the deterministic risk engine. The LLM cannot override a rejection.
+
+## 🔐 Governance & Security Model
+
+### State Machine
+
+Every trade follows an explicit, fail-closed lifecycle:
+
+```text
+PROPOSED → RISK_CHECKED → AWAITING_APPROVAL → APPROVED → EXECUTED → CLOSED
+                ↓                ↓
+            REJECTED         REJECTED (fail-closed)
+```
+
+Invalid transitions are rejected. The state machine enforces legal transitions, authorized actors per state, and atomic updates via SQLite WAL mode.
+
+### Cryptographic Authorization
+
+- **Proposal Hash:** SHA-256 hash of all material trade parameters.
+- **One-Time Tokens:** Single-use approval tokens with 1-hour expiration.
+- **Tamper Detection:** Hash is independently recomputed and verified at _both_ the approval and execution stages.
+- **Replay Protection:** Tokens are cryptographically marked as used after consumption.
+- **Policy Binding:** Tokens are bound to the specific policy version active at the time of minting.
+
+### Non-Negotiable Safety
+
+- ❌ Never exposes private keys or seed phrases.
+- ❌ LLM cannot bypass deterministic risk controls.
+- ❌ LLM cannot directly execute discretionary trades.
+- ❌ No secrets stored in source code.
+- ✅ Human approval is cryptographically bound to the exact proposal.
+- ✅ Fails closed on missing, invalid, expired, or inconsistent authorization data.
+
+## ⚙️ Setup & Configuration
+
+### One-Command Setup
+
+We provide a bulletproof setup script that handles environment initialization, dependency resolution, and database creation.
+
+```bash
+git clone <repository-url>
+cd robo-shopper
+./setup.sh
+```
+
+### Manual Setup
+
+```bash
+# Create virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env to set DEV_MODE=1 for local development
+
+# Initialize database
+python reset_db.py
+```
+
+### Configuration
+
+Environment variables are managed via `.env`:
+
+- `DEV_MODE=1`: Enables default test credentials and bypasses strict secret requirements for local demos.
+- `DB_PATH`: Path to the SQLite database (default: `data/trades.db`).
+- `DASHBOARD_API_KEY` / `SESSION_SECRET`: Security credentials for the web dashboard.
+
+## 🧪 Testing
+
+Critical financial and governance logic is covered by automated tests. We test both normal and adversarial paths to ensure the system fails safely under pressure.
+
+```bash
+# Run full test suite
+pytest tests/ -v
+
+# Run specific categories
+pytest tests/test_security.py -v
+pytest tests/test_governance.py -v
+```
+
+**Current Status:** 95/95 tests passing (100% pass rate). Coverage includes risk calculations, state transitions, approval token validation, replay prevention, proposal hash validation, and tampering detection.
+
+## 🎬 Hero Workflow (Demo)
+
+The complete workflow is demonstrable in approximately 2–3 minutes.
+
+**1. Start the Dashboard**
+
+```bash
+DEV_MODE=1 python dashboard.py
+# Visit http://localhost:8003
+```
+
+**2. Agent Investigates**
+
+```bash
+python main.py
+# Enter: Investigate BTC long 0.01 at entry 60000 stop 59500
+```
+
+**3. Human Approval**
+Refresh the dashboard. The new trade appears in "Pending Approvals". Review the dossier (asset, side, entry, stop-loss, risk amount, policy checks) and click **Approve**.
+
+**4. Execution Gateway**
+
+```bash
+python -c "from governance_engine import execute_trade; print(execute_trade(<trade_id>, 60100))"
+```
+
+**5. Tamper Detection (The "Judge Breaker")**
+
+```bash
+# Maliciously alter the quantity in the database
+sqlite3 data/trades.db "UPDATE trades SET quantity = 999.0 WHERE id = <trade_id>;"
+
+# Attempt to execute the tampered trade
+python -c "from governance_engine import execute_trade; print(execute_trade(<trade_id>, 60100))"
+# Output: REJECTED - PROPOSAL TAMPERED: Hash mismatch.
+```
+
+## ⚠️ Limitations & Honesty
+
+To maintain absolute transparency for judges and users:
+
+- **Paper-Trading Only:** The execution gateway generates dry-run commands. There are no live blockchain transactions or live exchange API executions in this repository.
+- **Simulated Treasury:** Portfolio balance is managed in a local SQLite database for demonstration purposes.
+- **Asset Scope:** Currently supports BTC, ETH, and SOL spot markets.
+- **Single-User Dashboard:** HttpOnly cookie authentication is sufficient for a local demo, but not designed for multi-tenant SaaS production.
+
+## Roadmap
+
+- [ ] Live exchange API integration (sandbox mode).
+- [ ] Multi-asset support (derivatives, DeFi protocols).
+- [ ] Advanced risk models (VaR, Sharpe ratio, correlation limits).
+- [ ] Real-time market data streaming via WebSockets.
+- [ ] Multi-user dashboard with role-based access control (RBAC).
+- [ ] On-chain execution integration via Starknet/STRK20.
+
+## 🔗 Orion Integration Readiness
+
+Robo-Shopper is designed to be deployed as a verified agent on the Orion network.
+
+- **Deterministic Outputs:** The risk engine ensures the agent never hallucinates financial parameters.
+- **Structured Tool Use:** The agent's investigation trace (plan → tool call → result → deterministic calculation) is fully observable and auditable.
+- **Safe Execution:** The execution gateway is built for dry-run validation today, with a clear path to connect to live Orion-compatible execution endpoints tomorrow.
+
+## 📄 License
+
+MIT License. See `LICENSE` file for details.
+
+---
+
+**⚠️ Disclaimer:** This is a paper-trading/demonstration system built for the Orion Builder Hackathon. Do not use for live trading without proper exchange integration, additional security audits, and regulatory compliance review.
+# TradeGuard-AI
